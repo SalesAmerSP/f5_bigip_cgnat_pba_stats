@@ -9,7 +9,7 @@ Interactive query tool that connects to F5 BIG-IP via SSH and displays per-subsc
 ```
 python cgnat_pba_stats.py --bigip 10.0.0.1 <host_ip>
 python cgnat_pba_stats.py --bigip 10.0.0.1 --pool POOL_NAME
-python cgnat_pba_stats.py --bigip 10.0.0.1 --xlated-ip 104.203.50.1
+python cgnat_pba_stats.py --bigip 10.0.0.1 --xlated-ip 198.51.100.1
 python cgnat_pba_stats.py --bigip 10.0.0.1 --all
 python cgnat_pba_stats.py --bigip 10.0.0.1 --summary
 python cgnat_pba_stats.py --bigip 10.0.0.1 --user admin --all   # prompts for password
