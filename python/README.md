@@ -76,7 +76,7 @@ python cgnat_pba_collect.py --bigip 10.0.0.1 --output csv --csv-file /path/to/ou
 # MySQL
 python cgnat_pba_collect.py --bigip 10.0.0.1 --output mysql \
     --db-host localhost --db-name cgnat \
-    --db-user root --db-pass secret
+    --db-user root --db-pass changeme
 
 # With SSH credentials
 python cgnat_pba_collect.py --bigip 10.0.0.1 --user admin --output csv
