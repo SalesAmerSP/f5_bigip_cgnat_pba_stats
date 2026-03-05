@@ -32,17 +32,17 @@ pba-stats --summary
 Use the installer script:
 
 ```bash
-./install-pba-stats.sh <bigip_host> [username] [ssh_port]
+./install-pba-stats.sh <bigip_host> [--user USERNAME] [--password] [--port PORT]
 
 # Examples
-./install-pba-stats.sh 10.0.0.1
-./install-pba-stats.sh bigip.example.com admin             # prompts for password
-./install-pba-stats.sh bigip.example.com admin 47001       # custom port + password
+./install-pba-stats.sh 10.0.0.1 --password                              # admin user, prompts for password
+./install-pba-stats.sh 10.0.0.1                                         # admin user, SSH key auth
+./install-pba-stats.sh 10.0.0.1 --user root --port 47001 --password     # custom user/port + password
 ```
 
-When a username is specified, the script prompts for the password. Without a username, SSH will use key-based authentication.
+The username defaults to `admin`. When `--password` is specified, SSH prompts for the password (once per command). Without `--password`, SSH key-based authentication is used. The installer tries SCP first and falls back to base64 transfer over SSH if SCP is unavailable.
 
-The installer validates the target is a BIG-IP, copies the script to `/shared/scripts/pba-stats`, creates a symlink at `/usr/local/bin/pba-stats`, and adds symlink recreation to `/config/startup` for boot persistence.
+The installer validates the target is a BIG-IP, copies the script to `/shared/scripts/pba-stats`, adds `/shared/scripts` to PATH via `/etc/profile.d/pba-stats.sh`, and configures `/config/startup` to recreate it after upgrades.
 
 <details>
 <summary>Manual installation</summary>
@@ -50,14 +50,14 @@ The installer validates the target is a BIG-IP, copies the script to `/shared/sc
 ```bash
 scp cgnat_pba_stats_bigip_compatible.py bigip:/shared/scripts/pba-stats
 ssh bigip 'chmod +x /shared/scripts/pba-stats'
-ssh bigip 'ln -sf /shared/scripts/pba-stats /usr/local/bin/pba-stats'
+ssh bigip 'echo "export PATH=/shared/scripts:\$PATH" > /etc/profile.d/pba-stats.sh'
 ```
 
-The symlink in `/usr/local/bin/` does not persist across BIG-IP upgrades. To recreate it on boot, add to `/config/startup`:
+`/etc/profile.d/` does not persist across BIG-IP upgrades. To recreate it on boot, add to `/config/startup`:
 
 ```bash
 #!/bin/bash
-ln -sf /shared/scripts/pba-stats /usr/local/bin/pba-stats
+echo 'export PATH=/shared/scripts:$PATH' > /etc/profile.d/pba-stats.sh
 ```
 
 </details>
@@ -76,7 +76,7 @@ python cgnat_pba_collect.py --bigip 10.0.0.1 --output csv --csv-file /path/to/ou
 # MySQL
 python cgnat_pba_collect.py --bigip 10.0.0.1 --output mysql \
     --db-host localhost --db-name cgnat \
-    --db-user root --db-pass secret
+    --db-user root --db-pass changeme
 
 # With SSH credentials
 python cgnat_pba_collect.py --bigip 10.0.0.1 --user admin --output csv

@@ -11,7 +11,7 @@ Replicates the Perl cgnat_db_logging.pl workflow:
 Usage:
     python cgnat_pba_collect.py --output csv
     python cgnat_pba_collect.py --output csv --csv-file /path/to/output.csv
-    python cgnat_pba_collect.py --output mysql --db-host localhost --db-name cgnat --db-user root --db-pass secret
+    python cgnat_pba_collect.py --output mysql --db-host localhost --db-name cgnat --db-user root --db-pass changeme
 """
 
 import argparse
