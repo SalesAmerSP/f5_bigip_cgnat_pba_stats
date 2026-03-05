@@ -16,10 +16,10 @@ See [python/README.md](python/README.md) for detailed usage.
 
 ### [python/install-pba-stats.sh](python/install-pba-stats.sh)
 
-Bash installer that deploys `cgnat_pba_stats_bigip_compatible.py` to a BIG-IP. Validates the target is a BIG-IP before installing, copies the script to persistent storage, creates the symlink, and configures boot persistence.
+Bash installer that deploys `cgnat_pba_stats_bigip_compatible.py` to a BIG-IP. Validates the target is a BIG-IP before installing, copies the script to persistent storage, adds it to PATH, and configures boot persistence.
 
 ```bash
-./python/install-pba-stats.sh <bigip_host> [username] [ssh_port]
+./python/install-pba-stats.sh <bigip_host> [--user USERNAME] [--password] [--port PORT]
 ```
 
 ## Background
