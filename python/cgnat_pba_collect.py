@@ -309,6 +309,9 @@ def export_mysql(rows: list[dict], timestamp: str, device: str,
                  db_host: str, db_port: int, db_name: str,
                  db_user: str, db_pass: str, db_table: str):
     """Write aggregated data to MySQL."""
+    if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", db_table):
+        print(f"ERROR: Invalid table name: {db_table}", file=sys.stderr)
+        sys.exit(1)
     try:
         import mysql.connector
     except ImportError:
