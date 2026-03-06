@@ -255,29 +255,31 @@ CSV_COLUMNS = [
 
 def export_csv(rows: list[dict], timestamp: str, device: str, csv_file: str | None):
     """Write aggregated data to CSV (file or stdout)."""
-    if csv_file:
-        fh = open(csv_file, "w", newline="")
-        print(f"Writing CSV to {csv_file}", file=sys.stderr)
-    else:
-        fh = sys.stdout
+    fh = None
+    try:
+        if csv_file:
+            fh = open(csv_file, "w", newline="")
+            print(f"Writing CSV to {csv_file}", file=sys.stderr)
+        else:
+            fh = sys.stdout
 
-    writer = csv.DictWriter(fh, fieldnames=CSV_COLUMNS)
-    writer.writeheader()
-    for row in rows:
-        writer.writerow({
-            "timestamp": timestamp,
-            "device": device,
-            "pool": row["pool"],
-            "client_ip": row["client_ip"],
-            "ports": row["ports"],
-            "blocks": row["blocks"],
-            "external_ips": row["external_ips"],
-            "block_size": row["block_size"],
-            "client_block_limit": row["client_block_limit"],
-        })
-
-    if csv_file:
-        fh.close()
+        writer = csv.DictWriter(fh, fieldnames=CSV_COLUMNS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({
+                "timestamp": timestamp,
+                "device": device,
+                "pool": row["pool"],
+                "client_ip": row["client_ip"],
+                "ports": row["ports"],
+                "blocks": row["blocks"],
+                "external_ips": row["external_ips"],
+                "block_size": row["block_size"],
+                "client_block_limit": row["client_block_limit"],
+            })
+    finally:
+        if fh and fh is not sys.stdout:
+            fh.close()
 
 # ---------------------------------------------------------------------------
 # Output: MySQL
@@ -327,24 +329,25 @@ def export_mysql(rows: list[dict], timestamp: str, device: str,
         host=db_host, port=db_port, database=db_name,
         user=db_user, password=db_pass,
     )
-    cursor = conn.cursor()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(CREATE_TABLE_SQL.format(table=db_table))
 
-    cursor.execute(CREATE_TABLE_SQL.format(table=db_table))
+        insert_sql = INSERT_SQL.format(table=db_table)
+        count = 0
+        for row in rows:
+            cursor.execute(insert_sql, (
+                timestamp, device, row["pool"], row["client_ip"],
+                row["ports"], row["blocks"], row["external_ips"],
+                row["block_size"], row["client_block_limit"],
+            ))
+            count += 1
 
-    insert_sql = INSERT_SQL.format(table=db_table)
-    count = 0
-    for row in rows:
-        cursor.execute(insert_sql, (
-            timestamp, device, row["pool"], row["client_ip"],
-            row["ports"], row["blocks"], row["external_ips"],
-            row["block_size"], row["client_block_limit"],
-        ))
-        count += 1
-
-    conn.commit()
-    cursor.close()
-    conn.close()
-    print(f"Inserted {count} rows into {db_name}.{db_table}", file=sys.stderr)
+        conn.commit()
+        print(f"Inserted {count} rows into {db_name}.{db_table}", file=sys.stderr)
+    finally:
+        cursor.close()
+        conn.close()
 
 # ---------------------------------------------------------------------------
 # Main
