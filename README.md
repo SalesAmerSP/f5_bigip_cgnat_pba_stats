@@ -24,7 +24,7 @@ Bash installer that deploys `cgnat_pba_stats_bigip_compatible.py` to a BIG-IP. V
 
 ## Compatibility
 
-These tools were developed and tested against **TMOS 17.1**. Older TMOS versions may not be supported, as differences in `lsndb` or `tmsh` command output formats could cause parsing failures.
+These tools were developed and tested against **TMOS 17.1** and **17.5.1.3 (build 0.0.19)**. Older TMOS versions may not be supported, as differences in `lsndb` or `tmsh` command output formats could cause parsing failures.
 
 ## Background
 
