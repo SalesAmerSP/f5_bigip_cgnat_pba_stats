@@ -91,6 +91,7 @@ def get_pba_entries() -> list[dict]:
         m = re.match(
             r"(\d+\.\d+\.\d+\.\d+)\s+"
             r"(\d+\.\d+\.\d+\.\d+):(\d+)\s+-\s+(\d+)\s+"
+            r"(?:\(\S+\)\s+)?"
             r"(\S+)\s+"
             r"(\d+)",
             line,
