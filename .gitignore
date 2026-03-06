@@ -36,5 +36,14 @@ Temporary Items
 # Built Visual Studio Code Extensions
 *.vsix
 
+# Secrets and credentials
+.env
+*.pem
+*.key
+id_rsa*
+
+# Output files (may contain subscriber data)
+*.csv
+
 # Claude Code
 .claude/
