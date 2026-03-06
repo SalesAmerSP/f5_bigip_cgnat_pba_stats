@@ -24,6 +24,7 @@ Same functionality as `cgnat_pba_stats.py` but designed to run directly on the B
 ```
 pba-stats <host_ip>
 pba-stats --pool POOL_NAME
+pba-stats --xlated-ip 198.51.100.1
 pba-stats --all
 pba-stats --summary
 ```
@@ -130,6 +131,8 @@ Host_IP                       External_IP                    Port_Block  Ports_U
 
 ## Enhanced Mode
 
+> Available in `cgnat_pba_stats.py` and `cgnat_pba_stats_bigip_compatible.py` only (not the collector).
+
 Add `--enhanced` to any query mode for additional statistics:
 
 ```
@@ -167,6 +170,8 @@ pba-stats --summary --enhanced
 Adds columns: Total Blocks, Pool%, and Avg Blocks/Client to the summary table.
 
 ## JSON Output
+
+> Available in `cgnat_pba_stats.py` and `cgnat_pba_stats_bigip_compatible.py` only (not the collector).
 
 Add `--json` to any query mode to get structured JSON output instead of text:
 
