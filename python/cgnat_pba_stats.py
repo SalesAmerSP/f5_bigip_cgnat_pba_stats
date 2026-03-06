@@ -22,33 +22,70 @@ import paramiko
 
 
 SSH_CLIENT: paramiko.SSHClient | None = None
+SSH_CONNECT_PARAMS: dict | None = None
 
 
 def ssh_connect(host: str, port: int, username: str | None = None,
                 password: str | None = None, no_host_key_check: bool = False):
     """Establish a persistent SSH connection to the BIG-IP."""
+    global SSH_CLIENT, SSH_CONNECT_PARAMS
+    SSH_CONNECT_PARAMS = {
+        "hostname": host, "port": port, "username": username,
+        "password": password, "timeout": 10,
+        "allow_agent": password is None, "look_for_keys": password is None,
+        "no_host_key_check": no_host_key_check,
+    }
+    _do_ssh_connect()
+
+
+def _do_ssh_connect():
+    """Internal: create and connect SSH client using stored params."""
     global SSH_CLIENT
+    params = SSH_CONNECT_PARAMS
     SSH_CLIENT = paramiko.SSHClient()
-    if no_host_key_check:
+    if params["no_host_key_check"]:
         SSH_CLIENT.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     else:
         SSH_CLIENT.load_system_host_keys()
         SSH_CLIENT.set_missing_host_key_policy(paramiko.WarningPolicy())
     SSH_CLIENT.connect(
-        hostname=host,
-        port=port,
-        username=username,
-        password=password,
-        timeout=10,
-        allow_agent=password is None,
-        look_for_keys=password is None,
+        hostname=params["hostname"], port=params["port"],
+        username=params["username"], password=params["password"],
+        timeout=params["timeout"],
+        allow_agent=params["allow_agent"],
+        look_for_keys=params["look_for_keys"],
     )
 
 
 def ssh_command(cmd: str, timeout: int = 30) -> str:
-    """Execute a command on the BIG-IP via the persistent SSH connection."""
+    """Execute a command on the BIG-IP via SSH, reconnecting if needed.
+
+    BIG-IP only supports one channel per SSH connection, so each command
+    after the first requires a fresh connection. A brief delay and retry
+    avoids connection rate-limiting on the BIG-IP side.
+    """
+    import time
+    global SSH_CLIENT
     assert SSH_CLIENT is not None, "SSH connection not established"
-    _stdin, stdout, stderr = SSH_CLIENT.exec_command(cmd, timeout=timeout)
+    try:
+        _, stdout, stderr = SSH_CLIENT.exec_command(cmd, timeout=timeout)
+    except paramiko.SSHException:
+        try:
+            SSH_CLIENT.close()
+        except Exception:
+            pass
+        last_err = None
+        for attempt in range(3):
+            try:
+                time.sleep(1 + attempt)
+                _do_ssh_connect()
+                _, stdout, stderr = SSH_CLIENT.exec_command(cmd, timeout=timeout)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+        if last_err is not None:
+            raise last_err
     output = stdout.read().decode() or stderr.read().decode() or ""
     lines = output.strip().split("\n")
     if len(lines) > 2:
@@ -72,8 +109,11 @@ def get_pool_configs() -> dict:
         bs_match = re.search(r"block-size (\d+)", line)
         cbl_match = re.search(r"client-block-limit (\d+)", line)
         addr_match = re.findall(r"addresses \{([^}]+)\}", line)
-        block_size = int(bs_match.group(1)) if bs_match else 256
-        client_block_limit = int(cbl_match.group(1)) if cbl_match else 1
+        if not bs_match or not cbl_match:
+            print(f"WARNING: Could not parse block-size/client-block-limit for {name}", file=sys.stderr)
+            continue
+        block_size = int(bs_match.group(1))
+        client_block_limit = int(cbl_match.group(1))
         addresses = []
         if addr_match:
             addresses = [a.strip().rstrip(" { }") for a in addr_match[0].split("}") if a.strip()]
@@ -181,6 +221,19 @@ def find_pool_for_ip(external_ip: str, pools: dict) -> tuple[str, dict]:
             except ValueError:
                 continue
     return None, None
+
+
+def infer_block_size(entries: list[dict]) -> int:
+    """Infer block size from PBA entries' port ranges when pool config is unavailable."""
+    if entries:
+        e = entries[0]
+        return e["port_end"] - e["port_start"] + 1
+    return 0
+
+
+def unknown_pool_cfg(entries: list[dict]) -> dict:
+    """Build a placeholder pool config for entries that don't match any known pool."""
+    return {"block_size": infer_block_size(entries), "client_block_limit": 0, "addresses": []}
 
 
 def count_ports_used(client_ip: str, port_start: int, port_end: int, mappings: list[dict]) -> int:
@@ -416,7 +469,7 @@ def show_host(host_ip: str, pba_entries: list[dict], mappings: list[dict], pools
 
     pool_name, pool_cfg = find_pool_for_ip(host_entries[0]["external_ip"], pools)
     if not pool_cfg:
-        pool_cfg = {"block_size": 256, "client_block_limit": 1, "addresses": []}
+        pool_cfg = unknown_pool_cfg(host_entries)
         pool_name = "Unknown"
 
     total_blocks = calc_total_port_blocks(pool_cfg)
@@ -463,8 +516,8 @@ def show_all(pba_entries: list[dict], mappings: list[dict], pools: dict,
         if not first:
             print()
         first = False
-        pool_cfg = pools.get(pool_name, {"block_size": 256, "client_block_limit": 1, "addresses": []})
         entries = pool_groups[pool_name]
+        pool_cfg = pools.get(pool_name) or unknown_pool_cfg(entries)
         total_blocks = calc_total_port_blocks(pool_cfg)
         print_pool_header(pool_name, pool_cfg, len(entries), total_blocks, enhanced=enhanced)
         print_pba_rows(entries, mappings, pool_cfg["block_size"], enhanced=enhanced)
@@ -615,7 +668,7 @@ def json_host(host_ip: str, pba_entries: list[dict], mappings: list[dict], pools
 
     pool_name, pool_cfg = find_pool_for_ip(host_entries[0]["external_ip"], pools)
     if not pool_cfg:
-        pool_cfg = {"block_size": 256, "client_block_limit": 1, "addresses": []}
+        pool_cfg = unknown_pool_cfg(host_entries)
         pool_name = "Unknown"
 
     block_size = pool_cfg["block_size"]
@@ -674,7 +727,7 @@ def json_xlated_ip(xlated_ip: str, pba_entries: list[dict], mappings: list[dict]
 
     pool_name, pool_cfg = find_pool_for_ip(xlated_ip, pools)
     if not pool_cfg:
-        pool_cfg = {"block_size": 256, "client_block_limit": 1, "addresses": []}
+        pool_cfg = unknown_pool_cfg(filtered)
         pool_name = "Unknown"
 
     total_blocks = calc_total_port_blocks(pool_cfg)
@@ -693,9 +746,10 @@ def json_all(pba_entries: list[dict], mappings: list[dict], pools: dict) -> dict
 
     pool_data = []
     for pool_name in sorted(pool_groups.keys()):
-        pool_cfg = pools.get(pool_name, {"block_size": 256, "client_block_limit": 1, "addresses": []})
+        entries = pool_groups[pool_name]
+        pool_cfg = pools.get(pool_name) or unknown_pool_cfg(entries)
         total_blocks = calc_total_port_blocks(pool_cfg)
-        pool_data.append(build_pool_data(pool_name, pool_cfg, pool_groups[pool_name], mappings, total_blocks))
+        pool_data.append(build_pool_data(pool_name, pool_cfg, entries, mappings, total_blocks))
 
     return {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -828,7 +882,7 @@ def main():
             else:
                 pool_name, pool_cfg = find_pool_for_ip(args.xlated_ip, pools)
                 if not pool_cfg:
-                    pool_cfg = {"block_size": 256, "client_block_limit": 1, "addresses": []}
+                    pool_cfg = unknown_pool_cfg(filtered)
                     pool_name = "Unknown"
                 total_blocks = calc_total_port_blocks(pool_cfg)
                 print_pool_header(pool_name, pool_cfg, len(filtered), total_blocks,

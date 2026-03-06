@@ -52,8 +52,11 @@ def get_pool_configs():
         bs_match = re.search(r"block-size (\d+)", line)
         cbl_match = re.search(r"client-block-limit (\d+)", line)
         addr_match = re.findall(r"addresses \{([^}]+)\}", line)
-        block_size = int(bs_match.group(1)) if bs_match else 256
-        client_block_limit = int(cbl_match.group(1)) if cbl_match else 1
+        if not bs_match or not cbl_match:
+            print("WARNING: Could not parse block-size/client-block-limit for %s" % name, file=sys.stderr)
+            continue
+        block_size = int(bs_match.group(1))
+        client_block_limit = int(cbl_match.group(1))
         addresses = []
         if addr_match:
             addresses = [a.strip().rstrip(" { }") for a in addr_match[0].split("}") if a.strip()]
@@ -118,6 +121,19 @@ def get_inbound_mappings():
 # ---------------------------------------------------------------------------
 # Pool / IP helpers
 # ---------------------------------------------------------------------------
+
+def infer_block_size(entries):
+    """Infer block size from PBA entries' port ranges when pool config is unavailable."""
+    if entries:
+        e = entries[0]
+        return e["port_end"] - e["port_start"] + 1
+    return 0
+
+
+def unknown_pool_cfg(entries):
+    """Build a placeholder pool config for entries that don't match any known pool."""
+    return {"block_size": infer_block_size(entries), "client_block_limit": 0, "addresses": []}
+
 
 def find_pool_for_ip(external_ip, pools):
     ext = ipaddress.ip_address(external_ip)
@@ -184,7 +200,10 @@ def calc_total_port_blocks(pool_cfg):
         except ValueError:
             continue
     port_range = 65535 - 1024 + 1
-    blocks_per_ip = port_range // pool_cfg.get("block_size", 256)
+    block_size = pool_cfg.get("block_size", 0)
+    if block_size == 0:
+        return 0
+    blocks_per_ip = port_range // block_size
     return total_ips * blocks_per_ip
 
 
@@ -347,7 +366,7 @@ def show_host(host_ip, pba_entries, mappings, pools, enhanced=False):
         return
     pool_name, pool_cfg = find_pool_for_ip(host_entries[0]["external_ip"], pools)
     if not pool_cfg:
-        pool_cfg = {"block_size": 256, "client_block_limit": 1, "addresses": []}
+        pool_cfg = unknown_pool_cfg(host_entries)
         pool_name = "Unknown"
     total_blocks = calc_total_port_blocks(pool_cfg)
     print_pool_header(pool_name, pool_cfg, len(host_entries), total_blocks, per_host=True,
@@ -389,8 +408,8 @@ def show_all(pba_entries, mappings, pools, enhanced=False):
         if not first:
             print()
         first = False
-        pool_cfg = pools.get(pool_name, {"block_size": 256, "client_block_limit": 1, "addresses": []})
         entries = pool_groups[pool_name]
+        pool_cfg = pools.get(pool_name) or unknown_pool_cfg(entries)
         total_blocks = calc_total_port_blocks(pool_cfg)
         print_pool_header(pool_name, pool_cfg, len(entries), total_blocks, enhanced=enhanced)
         print_pba_rows(entries, mappings, pool_cfg["block_size"], enhanced=enhanced)
@@ -523,7 +542,7 @@ def json_host(host_ip, pba_entries, mappings, pools):
 
     pool_name, pool_cfg = find_pool_for_ip(host_entries[0]["external_ip"], pools)
     if not pool_cfg:
-        pool_cfg = {"block_size": 256, "client_block_limit": 1, "addresses": []}
+        pool_cfg = unknown_pool_cfg(host_entries)
         pool_name = "Unknown"
 
     block_size = pool_cfg["block_size"]
@@ -582,7 +601,7 @@ def json_xlated_ip(xlated_ip, pba_entries, mappings, pools):
 
     pool_name, pool_cfg = find_pool_for_ip(xlated_ip, pools)
     if not pool_cfg:
-        pool_cfg = {"block_size": 256, "client_block_limit": 1, "addresses": []}
+        pool_cfg = unknown_pool_cfg(filtered)
         pool_name = "Unknown"
 
     total_blocks = calc_total_port_blocks(pool_cfg)
@@ -600,9 +619,10 @@ def json_all(pba_entries, mappings, pools):
 
     pool_data = []
     for pool_name in sorted(pool_groups.keys()):
-        pool_cfg = pools.get(pool_name, {"block_size": 256, "client_block_limit": 1, "addresses": []})
+        entries = pool_groups[pool_name]
+        pool_cfg = pools.get(pool_name) or unknown_pool_cfg(entries)
         total_blocks = calc_total_port_blocks(pool_cfg)
-        pool_data.append(build_pool_data(pool_name, pool_cfg, pool_groups[pool_name], mappings, total_blocks))
+        pool_data.append(build_pool_data(pool_name, pool_cfg, entries, mappings, total_blocks))
 
     return {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -704,7 +724,7 @@ def main():
             else:
                 pool_name, pool_cfg = find_pool_for_ip(args.xlated_ip, pools)
                 if not pool_cfg:
-                    pool_cfg = {"block_size": 256, "client_block_limit": 1, "addresses": []}
+                    pool_cfg = unknown_pool_cfg(filtered)
                     pool_name = "Unknown"
                 total_blocks = calc_total_port_blocks(pool_cfg)
                 print_pool_header(pool_name, pool_cfg, len(filtered), total_blocks,

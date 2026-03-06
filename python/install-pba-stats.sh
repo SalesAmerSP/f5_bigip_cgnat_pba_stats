@@ -128,19 +128,28 @@ else
     while [ -n "$ENCODED" ]; do
         CHUNK="${ENCODED:0:$CHUNK_SIZE}"
         ENCODED="${ENCODED:$CHUNK_SIZE}"
-        run_ssh "echo '$CHUNK' >> $REMOTE_PATH.b64"
+        # Retry each chunk up to 3 times to handle transient connection failures
+        for attempt in 1 2 3; do
+            RESULT=$($SSH_CMD "$SSH_TARGET" "echo '$CHUNK' >> $REMOTE_PATH.b64 && echo OK" 2>&1 || true)
+            if echo "$RESULT" | grep -q "OK"; then
+                break
+            fi
+            sleep 1
+        done
     done
     run_ssh "base64 -d $REMOTE_PATH.b64 > $REMOTE_PATH && rm -f $REMOTE_PATH.b64"
 fi
 
-# Verify the file was copied
-REMOTE_LINES=$(run_ssh "wc -l < $REMOTE_PATH" | grep -o '[0-9]*' | head -1)
-LOCAL_LINES=$(wc -l < "$LOCAL_SCRIPT" | tr -d '[:space:]')
-if [ -z "$REMOTE_LINES" ] || [ "$REMOTE_LINES" -lt 10 ]; then
-    echo "ERROR: File copy verification failed (expected $LOCAL_LINES lines, got ${REMOTE_LINES:-0})"
+# Verify the file was copied using md5 checksum
+LOCAL_MD5=$(md5 -q "$LOCAL_SCRIPT" 2>/dev/null || md5sum "$LOCAL_SCRIPT" | awk '{print $1}')
+REMOTE_MD5=$(run_ssh "md5sum $REMOTE_PATH" | grep -oE '^[a-f0-9]{32}')
+if [ "$LOCAL_MD5" != "$REMOTE_MD5" ]; then
+    echo "ERROR: File copy verification failed (md5 mismatch)"
+    echo "    Local:  $LOCAL_MD5"
+    echo "    Remote: $REMOTE_MD5"
     exit 1
 fi
-echo "    Verified: $REMOTE_LINES lines"
+echo "    Verified: md5 $LOCAL_MD5"
 
 echo "==> Setting up ..."
 run_ssh "chmod +x $REMOTE_PATH"
@@ -158,16 +167,20 @@ echo "    Created $PROFILE"
 
 echo "==> Configuring startup persistence ..."
 # /etc/profile.d doesn't persist across BIG-IP upgrades; recreate it on boot
-STARTUP_CMD="echo '$PATH_LINE' > $PROFILE"
 STARTUP_CHECK=$(run_ssh "cat /config/startup 2>/dev/null || echo ''")
 if echo "$STARTUP_CHECK" | grep -qF "pba-stats"; then
     echo "    /config/startup already contains pba-stats entry"
 elif echo "$STARTUP_CHECK" | grep -q "#!/bin/bash"; then
-    run_ssh "echo '$STARTUP_CMD' >> /config/startup"
+    run_ssh "cat >> /config/startup << 'STARTUP_EOF'
+echo 'export PATH=$PATH_DIR:\$PATH' > $PROFILE
+STARTUP_EOF"
     echo "    Added PATH setup to /config/startup"
 else
-    run_ssh "printf '#!/bin/bash\n$STARTUP_CMD\n' > /config/startup"
-    run_ssh "chmod +x /config/startup"
+    run_ssh "cat > /config/startup << 'STARTUP_EOF'
+#!/bin/bash
+echo 'export PATH=$PATH_DIR:\$PATH' > $PROFILE
+STARTUP_EOF
+chmod +x /config/startup"
     echo "    Created /config/startup"
 fi
 
