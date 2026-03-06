@@ -144,11 +144,11 @@ def find_pool_for_ip(external_ip, pools):
 
 
 def count_ports_used(client_ip, port_start, port_end, mappings):
-    count = 0
+    ports = set()
     for m in mappings:
         if m["client_ip"] == client_ip and port_start <= m["translation_port"] <= port_end:
-            count += 1
-    return count
+            ports.add(m["translation_port"])
+    return len(ports)
 
 
 def count_ports_by_protocol(client_ip, port_start, port_end, mappings):

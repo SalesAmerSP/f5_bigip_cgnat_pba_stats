@@ -184,12 +184,15 @@ def find_pool_for_ip(external_ip: str, pools: dict) -> tuple[str, dict]:
 
 
 def count_ports_used(client_ip: str, port_start: int, port_end: int, mappings: list[dict]) -> int:
-    """Count how many inbound mapping ports fall within a port block for a client."""
-    count = 0
+    """Count unique ports used within a port block for a client.
+
+    A port used by both TCP and UDP is counted once (unique port count).
+    """
+    ports = set()
     for m in mappings:
         if m["client_ip"] == client_ip and port_start <= m["translation_port"] <= port_end:
-            count += 1
-    return count
+            ports.add(m["translation_port"])
+    return len(ports)
 
 
 def count_ports_by_protocol(client_ip: str, port_start: int, port_end: int,
