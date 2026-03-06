@@ -135,7 +135,7 @@ run_ssh "chmod +x $REMOTE_PATH"
 
 echo "==> Configuring PATH ..."
 PROFILE="/etc/profile.d/pba-stats.sh"
-PATH_LINE="export PATH=$PATH_DIR:\\\$PATH"
+PATH_LINE="export PATH=$PATH_DIR:\$PATH"
 run_ssh "echo '$PATH_LINE' > $PROFILE"
 echo "    Created $PROFILE"
 
