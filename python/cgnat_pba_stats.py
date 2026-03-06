@@ -25,11 +25,15 @@ SSH_CLIENT: paramiko.SSHClient | None = None
 
 
 def ssh_connect(host: str, port: int, username: str | None = None,
-                password: str | None = None):
+                password: str | None = None, no_host_key_check: bool = False):
     """Establish a persistent SSH connection to the BIG-IP."""
     global SSH_CLIENT
     SSH_CLIENT = paramiko.SSHClient()
-    SSH_CLIENT.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    if no_host_key_check:
+        SSH_CLIENT.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    else:
+        SSH_CLIENT.load_system_host_keys()
+        SSH_CLIENT.set_missing_host_key_policy(paramiko.WarningPolicy())
     SSH_CLIENT.connect(
         hostname=host,
         port=port,
@@ -755,6 +759,8 @@ def main():
                         help="Show enhanced stats (utilization %%, protocol breakdown, top subscribers, etc.)")
     parser.add_argument("--json", action="store_true",
                         help="Output data as JSON instead of text")
+    parser.add_argument("--no-host-key-check", action="store_true",
+                        help="Disable SSH host key verification (insecure)")
 
     args = parser.parse_args()
 
@@ -764,7 +770,8 @@ def main():
         password = getpass.getpass(f"Password for {username}@{args.bigip}: ")
 
     try:
-        ssh_connect(args.bigip, int(args.port), username=username, password=password)
+        ssh_connect(args.bigip, int(args.port), username=username, password=password,
+                    no_host_key_check=args.no_host_key_check)
     except Exception as e:
         print(f"ERROR: Cannot connect to {args.bigip}:{args.port} - {e}", file=sys.stderr)
         sys.exit(1)
