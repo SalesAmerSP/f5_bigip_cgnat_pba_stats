@@ -22,6 +22,10 @@ Bash installer that deploys `cgnat_pba_stats_bigip_compatible.py` to a BIG-IP. V
 ./python/install-pba-stats.sh <bigip_host> [--user USERNAME] [--password] [--port PORT]
 ```
 
+## Compatibility
+
+These tools were developed and tested against **TMOS 17.1**. Older TMOS versions may not be supported, as differences in `lsndb` or `tmsh` command output formats could cause parsing failures.
+
 ## Background
 
 F5 BIG-IP CGNAT uses PBA to allocate port blocks to subscribers. BIG-IP does not provide a single CLI command to view per-subscriber port block allocations in a consolidated format. These tools bridge that gap by querying `lsndb` (for live PBA/inbound state) and `tmsh` (for pool configuration), then presenting the data in a readable format.
