@@ -1,6 +1,2 @@
-certifi==2026.2.25
-charset-normalizer==3.4.4
-idna==3.11
 paramiko>=3.0
-requests==2.32.5
-urllib3==2.6.3
+mysql-connector-python>=8.0
