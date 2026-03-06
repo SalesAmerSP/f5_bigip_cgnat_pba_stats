@@ -3,12 +3,13 @@
 # Install pba-stats on a F5 BIG-IP
 #
 # Usage:
-#   ./install-pba-stats.sh <bigip_host> [--user USERNAME] [--password] [--port PORT]
+#   ./install-pba-stats.sh <bigip_host> [--user USERNAME] [--password] [--port PORT] [--insecure]
 #
 # Examples:
 #   ./install-pba-stats.sh 10.0.0.1 --password                # admin user, prompts for password
 #   ./install-pba-stats.sh 10.0.0.1                           # admin user, SSH key auth
 #   ./install-pba-stats.sh 10.0.0.1 --user root --port 47001 --password
+#   ./install-pba-stats.sh 10.0.0.1 --insecure                # skip host key verification
 
 set -euo pipefail
 
@@ -24,6 +25,7 @@ usage() {
     echo "  --user USERNAME   SSH username (default: admin)"
     echo "  --password        Prompt for SSH password (otherwise uses key auth)"
     echo "  --port PORT       SSH port (default: 22)"
+    echo "  --insecure        Skip SSH host key verification"
     exit 1
 }
 
@@ -37,6 +39,7 @@ shift
 SSH_USER="admin"
 SSH_PORT="22"
 USE_PASSWORD=false
+INSECURE=false
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -52,6 +55,10 @@ while [ $# -gt 0 ]; do
             SSH_PORT="$2"
             shift 2
             ;;
+        --insecure)
+            INSECURE=true
+            shift
+            ;;
         *)
             echo "ERROR: Unknown option: $1"
             usage
@@ -59,7 +66,10 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
+SSH_OPTS="-o ConnectTimeout=10"
+if [ "$INSECURE" = true ]; then
+    SSH_OPTS="$SSH_OPTS -o StrictHostKeyChecking=no"
+fi
 
 if [ -n "$SSH_USER" ]; then
     SSH_TARGET="$SSH_USER@$BIGIP_HOST"

@@ -14,6 +14,7 @@ python cgnat_pba_stats.py --bigip 10.0.0.1 --all
 python cgnat_pba_stats.py --bigip 10.0.0.1 --summary
 python cgnat_pba_stats.py --bigip 10.0.0.1 --user admin --all   # prompts for password
 python cgnat_pba_stats.py --bigip 10.0.0.1 --port 47001 --all   # custom SSH port
+python cgnat_pba_stats.py --bigip 10.0.0.1 --all --no-host-key-check  # skip host key verification
 ```
 
 ### cgnat_pba_stats_bigip_compatible.py
@@ -32,12 +33,13 @@ pba-stats --summary
 Use the installer script:
 
 ```bash
-./install-pba-stats.sh <bigip_host> [--user USERNAME] [--password] [--port PORT]
+./install-pba-stats.sh <bigip_host> [--user USERNAME] [--password] [--port PORT] [--insecure]
 
 # Examples
 ./install-pba-stats.sh 10.0.0.1 --password                              # admin user, prompts for password
 ./install-pba-stats.sh 10.0.0.1                                         # admin user, SSH key auth
 ./install-pba-stats.sh 10.0.0.1 --user root --port 47001 --password     # custom user/port + password
+./install-pba-stats.sh 10.0.0.1 --insecure                              # skip host key verification
 ```
 
 The username defaults to `admin`. When `--password` is specified, SSH prompts for the password (once per command). Without `--password`, SSH key-based authentication is used. The installer tries SCP first and falls back to base64 transfer over SSH if SCP is unavailable.
@@ -80,6 +82,9 @@ python cgnat_pba_collect.py --bigip 10.0.0.1 --output mysql \
 
 # With SSH credentials
 python cgnat_pba_collect.py --bigip 10.0.0.1 --user admin --output csv
+
+# Skip host key verification
+python cgnat_pba_collect.py --bigip 10.0.0.1 --output csv --no-host-key-check
 ```
 
 Per-subscriber aggregated fields: pool, client_ip, ports in use, block count, external IPs, block_size, client_block_limit.

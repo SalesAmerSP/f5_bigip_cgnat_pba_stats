@@ -19,7 +19,7 @@ See [python/README.md](python/README.md) for detailed usage.
 Bash installer that deploys `cgnat_pba_stats_bigip_compatible.py` to a BIG-IP. Validates the target is a BIG-IP before installing, copies the script to persistent storage, adds it to PATH, and configures boot persistence.
 
 ```bash
-./python/install-pba-stats.sh <bigip_host> [--user USERNAME] [--password] [--port PORT]
+./python/install-pba-stats.sh <bigip_host> [--user USERNAME] [--password] [--port PORT] [--insecure]
 ```
 
 ## Compatibility
@@ -37,3 +37,9 @@ F5 BIG-IP CGNAT uses PBA to allocate port blocks to subscribers. BIG-IP does not
 | `lsndb list pba` | Port block allocations (client IP, external IP, port range, TTL) |
 | `lsndb list inbound` | Active inbound mappings (used to count ports in use per block) |
 | `tmsh list security nat source-translation one-line` | Pool configuration (block size, client block limit, address ranges) |
+
+## Author & Support
+
+Developed by Greg "G-Rob" Robinson from F5.
+
+This is a community project and is **not supported by F5 Support**. For bugs, feature requests, or questions, please open a [GitHub issue](https://github.com/SalesAmerSP/f5_bigip_cgnat_pba_stats/issues).
