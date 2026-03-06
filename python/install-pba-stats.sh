@@ -86,6 +86,8 @@ SSH_CMD="ssh -p $SSH_PORT $SSH_OPTS"
 SCP_CMD="scp -P $SSH_PORT $SSH_OPTS"
 
 run_ssh() {
+    # Note: BIG-IP SSH always returns exit code 255, so we cannot rely on
+    # exit codes for error detection. Critical steps use output validation.
     $SSH_CMD "$SSH_TARGET" "$@" 2>&1 || true
 }
 
@@ -147,6 +149,11 @@ echo "==> Configuring PATH ..."
 PROFILE="/etc/profile.d/pba-stats.sh"
 PATH_LINE="export PATH=$PATH_DIR:\$PATH"
 run_ssh "echo '$PATH_LINE' > $PROFILE"
+PROFILE_CHECK=$(run_ssh "cat $PROFILE 2>/dev/null")
+if ! echo "$PROFILE_CHECK" | grep -qF "$PATH_DIR"; then
+    echo "ERROR: Failed to write $PROFILE"
+    exit 1
+fi
 echo "    Created $PROFILE"
 
 echo "==> Configuring startup persistence ..."
