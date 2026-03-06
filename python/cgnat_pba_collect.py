@@ -31,6 +31,7 @@ import paramiko
 
 DEVICE_NAME = "bigip01"
 SSH_CLIENT: paramiko.SSHClient | None = None
+SSH_CONNECT_PARAMS: dict | None = None
 
 OUTPUT_MODE = "csv"  # "csv" or "mysql"
 
@@ -52,28 +53,64 @@ CSV_FILE = None  # None = stdout
 def ssh_connect(host: str, port: int, username: str | None = None,
                 password: str | None = None, no_host_key_check: bool = False):
     """Establish a persistent SSH connection to the BIG-IP."""
+    global SSH_CONNECT_PARAMS
+    SSH_CONNECT_PARAMS = {
+        "hostname": host, "port": port, "username": username,
+        "password": password, "timeout": 10,
+        "allow_agent": password is None, "look_for_keys": password is None,
+        "no_host_key_check": no_host_key_check,
+    }
+    _do_ssh_connect()
+
+
+def _do_ssh_connect():
+    """Internal: create and connect SSH client using stored params."""
     global SSH_CLIENT
+    params = SSH_CONNECT_PARAMS
     SSH_CLIENT = paramiko.SSHClient()
-    if no_host_key_check:
+    if params["no_host_key_check"]:
         SSH_CLIENT.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     else:
         SSH_CLIENT.load_system_host_keys()
         SSH_CLIENT.set_missing_host_key_policy(paramiko.WarningPolicy())
     SSH_CLIENT.connect(
-        hostname=host,
-        port=port,
-        username=username,
-        password=password,
-        timeout=10,
-        allow_agent=password is None,
-        look_for_keys=password is None,
+        hostname=params["hostname"], port=params["port"],
+        username=params["username"], password=params["password"],
+        timeout=params["timeout"],
+        allow_agent=params["allow_agent"],
+        look_for_keys=params["look_for_keys"],
     )
 
 
 def ssh_command(cmd: str, timeout: int = 30) -> str:
-    """Execute a command on the BIG-IP via the persistent SSH connection."""
+    """Execute a command on the BIG-IP via SSH, reconnecting if needed.
+
+    BIG-IP only supports one channel per SSH connection, so each command
+    after the first requires a fresh connection. A brief delay avoids
+    connection rate-limiting on the BIG-IP side.
+    """
+    import time
+    global SSH_CLIENT
     assert SSH_CLIENT is not None, "SSH connection not established"
-    _stdin, stdout, stderr = SSH_CLIENT.exec_command(cmd, timeout=timeout)
+    try:
+        _, stdout, stderr = SSH_CLIENT.exec_command(cmd, timeout=timeout)
+    except paramiko.SSHException:
+        try:
+            SSH_CLIENT.close()
+        except Exception:
+            pass
+        last_err = None
+        for attempt in range(3):
+            try:
+                time.sleep(1 + attempt)
+                _do_ssh_connect()
+                _, stdout, stderr = SSH_CLIENT.exec_command(cmd, timeout=timeout)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+        if last_err is not None:
+            raise last_err
     output = stdout.read().decode() or stderr.read().decode() or ""
     lines = output.strip().split("\n")
     if len(lines) > 2:
@@ -100,8 +137,11 @@ def get_pool_configs() -> dict:
         bs_match = re.search(r"block-size (\d+)", line)
         cbl_match = re.search(r"client-block-limit (\d+)", line)
         addr_match = re.findall(r"addresses \{([^}]+)\}", line)
-        block_size = int(bs_match.group(1)) if bs_match else 256
-        client_block_limit = int(cbl_match.group(1)) if cbl_match else 1
+        if not bs_match or not cbl_match:
+            print(f"WARNING: Could not parse block-size/client-block-limit for {name}", file=sys.stderr)
+            continue
+        block_size = int(bs_match.group(1))
+        client_block_limit = int(cbl_match.group(1))
         addresses = []
         if addr_match:
             addresses = [a.strip().rstrip(" { }") for a in addr_match[0].split("}") if a.strip()]
