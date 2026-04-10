@@ -190,6 +190,22 @@ JSON output is compact (not pretty-printed) for use in API calls and scripting. 
 
 ## Requirements
 
-- Python 3.8+ (for local script on BIG-IP) / Python 3.10+ (for remote scripts)
-- `paramiko` (for remote SSH scripts)
-- `mysql-connector-python` (only if using MySQL export in collector)
+- Python 3.8+ (for the on-device script) / Python 3.9+ (for the remote scripts)
+- Dependencies for the remote scripts: `paramiko`, `mysql-connector-python`
+  (the on-device script has no third-party dependencies)
+
+### Installing dependencies (hash-verified)
+
+Dependencies are pinned with SHA-256 hashes in [requirements.txt](requirements.txt).
+Install with `--require-hashes` to block PyPI mirror tampering and typosquatting:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --require-hashes -r requirements.txt
+```
+
+If `--require-hashes` fails, the lock file is out of date with respect to your
+Python version or a transitive dependency has changed — do not fall back to
+an unchecked install. Regenerate with `pip-compile --generate-hashes` from
+[requirements.in](requirements.in) instead.

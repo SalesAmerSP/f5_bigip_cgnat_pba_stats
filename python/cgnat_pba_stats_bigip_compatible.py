@@ -10,8 +10,8 @@ Install:
 
 Usage:
     pba-stats <host_ip>
-    pba-stats --pool POOL-DMA-FL-Miami
-    pba-stats --xlated-ip 198.51.100.1
+    pba-stats --pool [pool_name]
+    pba-stats --xlated-ip [ip_address]
     pba-stats --all
     pba-stats --summary
     pba-stats --all --enhanced
@@ -51,7 +51,10 @@ def get_pool_configs():
         name = name_match.group(1)
         bs_match = re.search(r"block-size (\d+)", line)
         cbl_match = re.search(r"client-block-limit (\d+)", line)
-        addr_match = re.findall(r"addresses \{([^}]+)\}", line)
+        # Capture the full inner body of `addresses { ... }` including the
+        # nested `{ }` that follows each entry. `[^}]+` stopped at the first
+        # inner brace and only captured the first address.
+        addr_match = re.findall(r"addresses \{((?:[^{}]*\{[^{}]*\})*[^{}]*)\}", line)
         if not bs_match or not cbl_match:
             print("WARNING: Could not parse block-size/client-block-limit for %s" % name, file=sys.stderr)
             continue
@@ -312,7 +315,11 @@ def print_enhanced_pool_footer(entries, mappings, pool_cfg, pool_name, total_blo
     total_blocks_used = len(entries)
     avg_blocks = total_blocks_used / unique_clients if unique_clients > 0 else 0
     total_ports = sum(s["ports"] for s in client_stats.values())
-    total_capacity = total_blocks_used * block_size
+    # Pool port capacity is the full pool (all available blocks * block_size),
+    # not just the blocks currently allocated. Previously this used
+    # total_blocks_used, which understated the denominator and made the
+    # utilization percentage look dramatically higher than reality.
+    total_capacity = total_blocks * block_size
     util_pct = (total_ports / total_capacity * 100) if total_capacity > 0 else 0
     pool_util_pct = (total_blocks_used / total_blocks * 100) if total_blocks > 0 else 0
 
@@ -497,7 +504,9 @@ def build_pool_data(pool_name, pool_cfg, entries, mappings, total_blocks):
         client_stats[cip]["external_ips"].add(block["external_ip"])
 
     total_ports = sum(b["ports_used"] for b in blocks)
-    total_capacity = len(entries) * block_size
+    # Pool port capacity is the full pool (all available blocks * block_size),
+    # not just the blocks currently allocated.
+    total_capacity = total_blocks * block_size
     pool_util_pct = (len(entries) / total_blocks * 100) if total_blocks > 0 else 0
     port_util_pct = (total_ports / total_capacity * 100) if total_capacity > 0 else 0
 

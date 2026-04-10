@@ -4,8 +4,8 @@ CGNAT PBA Stats - Query per-subscriber port block allocations on F5 BIG-IP via S
 using lsndb and tmsh commands.
 
 Usage:
-    python cgnat_pba_stats.py --bigip 10.0.0.1 <host_ip>
-    python cgnat_pba_stats.py --bigip bigip.example.com --pool POOL-DMA-FL-Miami
+    python cgnat_pba_stats.py --bigip bigip.example.com <host_ip>
+    python cgnat_pba_stats.py --bigip bigip.example.com --pool [pool_name]
     python cgnat_pba_stats.py --bigip bigip.example.com --all
     python cgnat_pba_stats.py --bigip bigip.example.com --summary
 """
@@ -108,7 +108,10 @@ def get_pool_configs() -> dict:
         name = name_match.group(1)
         bs_match = re.search(r"block-size (\d+)", line)
         cbl_match = re.search(r"client-block-limit (\d+)", line)
-        addr_match = re.findall(r"addresses \{([^}]+)\}", line)
+        # Capture the full inner body of `addresses { ... }` including the
+        # nested `{ }` that follows each entry. `[^}]+` stopped at the first
+        # inner brace and only captured the first address.
+        addr_match = re.findall(r"addresses \{((?:[^{}]*\{[^{}]*\})*[^{}]*)\}", line)
         if not bs_match or not cbl_match:
             print(f"WARNING: Could not parse block-size/client-block-limit for {name}", file=sys.stderr)
             continue
@@ -417,7 +420,11 @@ def print_enhanced_pool_footer(entries: list[dict], mappings: list[dict], pool_c
     total_blocks_used = len(entries)
     avg_blocks = total_blocks_used / unique_clients if unique_clients > 0 else 0
     total_ports = sum(s["ports"] for s in client_stats.values())
-    total_capacity = total_blocks_used * block_size
+    # Pool port capacity is the full pool (all available blocks * block_size),
+    # not just the blocks currently allocated. Previously this used
+    # total_blocks_used, which understated the denominator and made the
+    # utilization percentage look dramatically higher than reality.
+    total_capacity = total_blocks * block_size
     util_pct = (total_ports / total_capacity * 100) if total_capacity > 0 else 0
     pool_util_pct = (total_blocks_used / total_blocks * 100) if total_blocks > 0 else 0
 
@@ -621,7 +628,9 @@ def build_pool_data(pool_name: str, pool_cfg: dict, entries: list[dict],
         client_stats[cip]["external_ips"].add(block["external_ip"])
 
     total_ports = sum(b["ports_used"] for b in blocks)
-    total_capacity = len(entries) * block_size
+    # Pool port capacity is the full pool (all available blocks * block_size),
+    # not just the blocks currently allocated.
+    total_capacity = total_blocks * block_size
     pool_util_pct = (len(entries) / total_blocks * 100) if total_blocks > 0 else 0
     port_util_pct = (total_ports / total_capacity * 100) if total_capacity > 0 else 0
 

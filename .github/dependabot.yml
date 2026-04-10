@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # Python dependencies for the remote scripts and collector.
+  # The on-device script (cgnat_pba_stats_bigip_compatible.py) uses only
+  # the Python standard library and has no dependencies to track.
+  - package-ecosystem: pip
+    directory: /python
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    labels:
+      - dependencies
+      - security

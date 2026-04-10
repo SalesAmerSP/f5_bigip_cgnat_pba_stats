@@ -38,8 +38,18 @@ F5 BIG-IP CGNAT uses PBA to allocate port blocks to subscribers. BIG-IP does not
 | `lsndb list inbound` | Active inbound mappings (used to count ports in use per block) |
 | `tmsh list security nat source-translation one-line` | Pool configuration (block size, client block limit, address ranges) |
 
+## Security
+
+For how to report a vulnerability and the project's supply-chain hygiene
+practices (pinned dependencies with hashes, Dependabot, SHA-256 install
+verification), see [SECURITY.md](SECURITY.md).
+
+**Do not report security issues in public GitHub issues.** Use GitHub's
+[private vulnerability reporting](https://github.com/SalesAmerSP/f5_bigip_cgnat_pba_stats/security/advisories/new)
+instead.
+
 ## Author & Support
 
 Developed by Greg "G-Rob" Robinson from F5.
 
-This is a community project and is **not supported by F5 Support**. For bugs, feature requests, or questions, please open a [GitHub issue](https://github.com/SalesAmerSP/f5_bigip_cgnat_pba_stats/issues).
+This is a community project and is **not supported by F5 Support**. For bugs, feature requests, or questions, please open a [GitHub issue](https://github.com/SalesAmerSP/f5_bigip_cgnat_pba_stats/issues). For security issues, see [SECURITY.md](SECURITY.md).
