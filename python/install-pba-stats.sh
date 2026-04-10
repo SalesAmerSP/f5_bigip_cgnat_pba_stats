@@ -164,16 +164,19 @@ else
     run_ssh "base64 -d $REMOTE_PATH.b64 > $REMOTE_PATH && rm -f $REMOTE_PATH.b64"
 fi
 
-# Verify the file was copied using md5 checksum
-LOCAL_MD5=$(md5 -q "$LOCAL_SCRIPT" 2>/dev/null || md5sum "$LOCAL_SCRIPT" | awk '{print $1}')
-REMOTE_MD5=$(run_ssh "md5sum $REMOTE_PATH" | grep -oE '^[a-f0-9]{32}')
-if [ "$LOCAL_MD5" != "$REMOTE_MD5" ]; then
-    echo "ERROR: File copy verification failed (md5 mismatch)"
-    echo "    Local:  $LOCAL_MD5"
-    echo "    Remote: $REMOTE_MD5"
+# Verify the file was copied using a SHA-256 checksum. MD5 is broken and
+# a real attacker could collide two files, which defeats the purpose of
+# an integrity check on a file we just transferred over a potentially
+# untrusted intermediary.
+LOCAL_SHA=$(shasum -a 256 "$LOCAL_SCRIPT" 2>/dev/null | awk '{print $1}' || sha256sum "$LOCAL_SCRIPT" | awk '{print $1}')
+REMOTE_SHA=$(run_ssh "sha256sum $REMOTE_PATH" | strip_banner | grep -oE '^[a-f0-9]{64}' | head -1)
+if [ "$LOCAL_SHA" != "$REMOTE_SHA" ]; then
+    echo "ERROR: File copy verification failed (sha256 mismatch)"
+    echo "    Local:  $LOCAL_SHA"
+    echo "    Remote: $REMOTE_SHA"
     exit 1
 fi
-echo "    Verified: md5 $LOCAL_MD5"
+echo "    Verified: sha256 $LOCAL_SHA"
 
 echo "==> Setting up ..."
 run_ssh "chmod +x $REMOTE_PATH"
