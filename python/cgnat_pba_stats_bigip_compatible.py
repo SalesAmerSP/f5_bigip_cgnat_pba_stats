@@ -51,7 +51,10 @@ def get_pool_configs():
         name = name_match.group(1)
         bs_match = re.search(r"block-size (\d+)", line)
         cbl_match = re.search(r"client-block-limit (\d+)", line)
-        addr_match = re.findall(r"addresses \{([^}]+)\}", line)
+        # Capture the full inner body of `addresses { ... }` including the
+        # nested `{ }` that follows each entry. `[^}]+` stopped at the first
+        # inner brace and only captured the first address.
+        addr_match = re.findall(r"addresses \{((?:[^{}]*\{[^{}]*\})*[^{}]*)\}", line)
         if not bs_match or not cbl_match:
             print("WARNING: Could not parse block-size/client-block-limit for %s" % name, file=sys.stderr)
             continue
