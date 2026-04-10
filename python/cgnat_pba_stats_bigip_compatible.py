@@ -10,8 +10,8 @@ Install:
 
 Usage:
     pba-stats <host_ip>
-    pba-stats --pool POOL-DMA-FL-Miami
-    pba-stats --xlated-ip 198.51.100.1
+    pba-stats --pool [pool_name]
+    pba-stats --xlated-ip [ip_address]
     pba-stats --all
     pba-stats --summary
     pba-stats --all --enhanced

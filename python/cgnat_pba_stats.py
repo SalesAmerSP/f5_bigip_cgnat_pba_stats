@@ -4,8 +4,8 @@ CGNAT PBA Stats - Query per-subscriber port block allocations on F5 BIG-IP via S
 using lsndb and tmsh commands.
 
 Usage:
-    python cgnat_pba_stats.py --bigip 10.0.0.1 <host_ip>
-    python cgnat_pba_stats.py --bigip bigip.example.com --pool POOL-DMA-FL-Miami
+    python cgnat_pba_stats.py --bigip bigip.example.com <host_ip>
+    python cgnat_pba_stats.py --bigip bigip.example.com --pool [pool_name]
     python cgnat_pba_stats.py --bigip bigip.example.com --all
     python cgnat_pba_stats.py --bigip bigip.example.com --summary
 """
