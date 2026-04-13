@@ -1,3 +1,4 @@
+<!-- markdownlint-disable MD033 -->
 # CGNAT PBA Monitoring - Python Scripts
 
 ## Scripts
@@ -94,17 +95,17 @@ Per-subscriber aggregated fields: pool, client_ip, ports in use, block count, ex
 
 The script auto-creates the table with the following columns:
 
-| Column | Type | Notes |
-|--------|------|-------|
-| timestamp | DATETIME | Collection time |
-| device | VARCHAR(64) | Device name |
-| pool | VARCHAR(128) | Source-translation pool name |
-| client_ip | INT UNSIGNED | Stored via INET_ATON() |
-| ports | INT | Total ports in use |
-| blocks | INT | Number of port blocks allocated |
-| external_ips | VARCHAR(512) | Comma-separated translated IPs |
-| block_size | INT | Pool's configured block size |
-| client_block_limit | INT | Pool's max blocks per client |
+| Column             | Type         | Notes                           |
+|--------------------|--------------|---------------------------------|
+| timestamp          | DATETIME     | Collection time                 |
+| device             | VARCHAR(64)  | Device name                     |
+| pool               | VARCHAR(128) | Source-translation pool name    |
+| client_ip          | INT UNSIGNED | Stored via INET_ATON()          |
+| ports              | INT          | Total ports in use              |
+| blocks             | INT          | Number of port blocks allocated |
+| external_ips       | VARCHAR(512) | Comma-separated translated IPs  |
+| block_size         | INT          | Pool's configured block size    |
+| client_block_limit | INT          | Pool's max blocks per client    |
 
 ## Output Format
 
