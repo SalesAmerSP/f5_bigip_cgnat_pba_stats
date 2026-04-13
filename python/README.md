@@ -6,7 +6,7 @@
 
 Interactive query tool that connects to F5 BIG-IP via SSH and displays per-subscriber PBA data.
 
-```
+```bash
 python cgnat_pba_stats.py --bigip 10.0.0.1 <host_ip>
 python cgnat_pba_stats.py --bigip 10.0.0.1 --pool POOL_NAME
 python cgnat_pba_stats.py --bigip 10.0.0.1 --xlated-ip 198.51.100.1
@@ -21,7 +21,7 @@ python cgnat_pba_stats.py --bigip 10.0.0.1 --all --no-host-key-check  # skip hos
 
 Same functionality as `cgnat_pba_stats.py` but designed to run directly on the BIG-IP. Calls `lsndb` and `tmsh` locally without SSH. Compatible with BIG-IP's Python 3.8.
 
-```
+```bash
 pba-stats <host_ip>
 pba-stats --pool POOL_NAME
 pba-stats --xlated-ip 198.51.100.1
@@ -69,7 +69,7 @@ echo 'export PATH=/shared/scripts:$PATH' > /etc/profile.d/pba-stats.sh
 
 Data collector that aggregates per-subscriber PBA statistics and exports to CSV or MySQL. Designed for periodic collection (e.g., cron).
 
-```
+```bash
 # CSV to stdout
 python cgnat_pba_collect.py --bigip 10.0.0.1 --output csv
 
@@ -110,7 +110,7 @@ The script auto-creates the table with the following columns:
 
 Example output:
 
-```
+```text
 Mar 04 14:30:00
 
 Pool name: MyPool
@@ -135,7 +135,7 @@ Host_IP                       External_IP                    Port_Block  Ports_U
 
 Add `--enhanced` to any query mode for additional statistics:
 
-```
+```bash
 python cgnat_pba_stats.py --bigip 10.0.0.1 --all --enhanced
 pba-stats --pool MyPool --enhanced
 pba-stats 10.0.0.1 --enhanced
@@ -175,7 +175,7 @@ Adds columns: Total Blocks, Pool%, and Avg Blocks/Client to the summary table.
 
 Add `--json` to any query mode to get structured JSON output instead of text:
 
-```
+```bash
 python cgnat_pba_stats.py --bigip 10.0.0.1 --all --json
 pba-stats 10.0.0.1 --json
 pba-stats --summary --json
@@ -209,4 +209,3 @@ If `--require-hashes` fails, the lock file is out of date with respect to your
 Python version or a transitive dependency has changed — do not fall back to
 an unchecked install. Regenerate with `pip-compile --generate-hashes` from
 [requirements.in](requirements.in) instead.
-
