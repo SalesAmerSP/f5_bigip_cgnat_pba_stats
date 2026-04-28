@@ -13,12 +13,31 @@ Usage:
 import argparse
 import getpass
 import json
+import os
 import re
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime
 
 import paramiko
+
+
+class Timer:
+    """Simple timing context manager."""
+    def __init__(self, description: str):
+        self.description = description
+        self.start_time = None
+
+    def __enter__(self):
+        self.start_time = time.time()
+        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Starting: {self.description}", file=sys.stderr)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        end_time = time.time()
+        duration = end_time - self.start_time
+        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Completed: {self.description} ({duration:.3f}s)", file=sys.stderr)
 
 
 SSH_CLIENT: paramiko.SSHClient | None = None
@@ -26,13 +45,15 @@ SSH_CONNECT_PARAMS: dict | None = None
 
 
 def ssh_connect(host: str, port: int, username: str | None = None,
-                password: str | None = None, no_host_key_check: bool = False):
+                password: str | None = None, key_filename: str | None = None,
+                no_host_key_check: bool = False):
     """Establish a persistent SSH connection to the BIG-IP."""
     global SSH_CLIENT, SSH_CONNECT_PARAMS
     SSH_CONNECT_PARAMS = {
         "hostname": host, "port": port, "username": username,
-        "password": password, "timeout": 10,
-        "allow_agent": password is None, "look_for_keys": password is None,
+        "password": password, "key_filename": key_filename, "timeout": 10,
+        "allow_agent": password is None,
+        "look_for_keys": password is None and key_filename is None,
         "no_host_key_check": no_host_key_check,
     }
     _do_ssh_connect()
@@ -51,7 +72,7 @@ def _do_ssh_connect():
     SSH_CLIENT.connect(
         hostname=params["hostname"], port=params["port"],
         username=params["username"], password=params["password"],
-        timeout=params["timeout"],
+        key_filename=params["key_filename"], timeout=params["timeout"],
         allow_agent=params["allow_agent"],
         look_for_keys=params["look_for_keys"],
     )
@@ -182,6 +203,17 @@ def get_inbound_mappings() -> list[dict]:
     return mappings
 
 
+def build_mapping_indexes(mappings: list[dict]) -> tuple[dict[tuple[str, str], list[dict]], dict[str, list[dict]]]:
+    """Build lookup indexes for inbound mappings."""
+    mapping_index: dict[tuple[str, str], list[dict]] = {}
+    client_mapping_index: dict[str, list[dict]] = defaultdict(list)
+    for m in mappings:
+        key = (m["client_ip"], m["translation_ip"])
+        mapping_index.setdefault(key, []).append(m)
+        client_mapping_index[m["client_ip"]].append(m)
+    return mapping_index, client_mapping_index
+
+
 def get_persistence_entries() -> dict:
     """Get persistence entries mapping client IPs to external IPs."""
     raw = ssh_command("bash -c 'lsndb list persistence'")
@@ -239,24 +271,23 @@ def unknown_pool_cfg(entries: list[dict]) -> dict:
     return {"block_size": infer_block_size(entries), "client_block_limit": 0, "addresses": []}
 
 
-def count_ports_used(client_ip: str, port_start: int, port_end: int, mappings: list[dict]) -> int:
-    """Count unique ports used within a port block for a client.
-
-    A port used by both TCP and UDP is counted once (unique port count).
-    """
+def count_ports_used(client_ip: str, translation_ip: str, port_start: int,
+                     port_end: int, mapping_index: dict[tuple[str, str], list[dict]]) -> int:
+    """Count unique ports used within a port block for a client."""
     ports = set()
-    for m in mappings:
-        if m["client_ip"] == client_ip and port_start <= m["translation_port"] <= port_end:
+    for m in mapping_index.get((client_ip, translation_ip), []):
+        if port_start <= m["translation_port"] <= port_end:
             ports.add(m["translation_port"])
     return len(ports)
 
 
-def count_ports_by_protocol(client_ip: str, port_start: int, port_end: int,
-                            mappings: list[dict]) -> dict[str, int]:
+def count_ports_by_protocol(client_ip: str, translation_ip: str, port_start: int,
+                            port_end: int,
+                            mapping_index: dict[tuple[str, str], list[dict]]) -> dict[str, int]:
     """Count ports used per protocol within a port block for a client."""
     proto_counts: dict[str, int] = defaultdict(int)
-    for m in mappings:
-        if m["client_ip"] == client_ip and port_start <= m["translation_port"] <= port_end:
+    for m in mapping_index.get((client_ip, translation_ip), []):
+        if port_start <= m["translation_port"] <= port_end:
             proto_counts[m.get("protocol", "?")] += 1
     return dict(proto_counts)
 
@@ -340,13 +371,15 @@ def print_pool_header(pool_name: str, pool_cfg: dict, used_blocks: int, total_bl
     print(base_sub)
 
 
-def print_pba_rows(entries: list[dict], mappings: list[dict], block_size: int,
-                   enhanced: bool = False):
+def print_pba_rows(entries: list[dict], mapping_index: dict[tuple[str, str], list[dict]],
+                   block_size: int, enhanced: bool = False):
     """Print PBA entry rows sorted by external_ip then port_start."""
     entries.sort(key=lambda e: (e["external_ip"], e["port_start"]))
     for entry in entries:
         port_range = f"{entry['port_start']}-{entry['port_end']}"
-        ports_used = count_ports_used(entry["client_ip"], entry["port_start"], entry["port_end"], mappings)
+        ports_used = count_ports_used(
+            entry["client_ip"], entry["external_ip"], entry["port_start"], entry["port_end"], mapping_index
+        )
         state = determine_block_state(ports_used, entry["ttl"])
         ttl_str = "-" if entry["ttl"] == 0 else str(entry["ttl"])
         line = (
@@ -359,7 +392,7 @@ def print_pba_rows(entries: list[dict], mappings: list[dict], block_size: int,
         if enhanced:
             util_pct = (ports_used / block_size * 100) if block_size > 0 else 0
             proto_counts = count_ports_by_protocol(
-                entry["client_ip"], entry["port_start"], entry["port_end"], mappings
+                entry["client_ip"], entry["external_ip"], entry["port_start"], entry["port_end"], mapping_index
             )
             proto_str = " ".join(f"{proto}:{cnt}" for proto, cnt in sorted(proto_counts.items())) if proto_counts else "-"
             sub_id = entry.get("subscriber_id", "-")
@@ -367,8 +400,8 @@ def print_pba_rows(entries: list[dict], mappings: list[dict], block_size: int,
         print(line)
 
 
-def print_enhanced_host_footer(host_ip: str, entries: list[dict], mappings: list[dict],
-                               pool_cfg: dict):
+def print_enhanced_host_footer(host_ip: str, entries: list[dict],
+                               client_mapping_index: dict[str, list[dict]], pool_cfg: dict):
     """Print enhanced per-host summary footer."""
     block_size = pool_cfg["block_size"]
     max_blocks = pool_cfg["client_block_limit"]
@@ -378,8 +411,8 @@ def print_enhanced_host_footer(host_ip: str, entries: list[dict], mappings: list
     total_ports = 0
     proto_totals: dict[str, int] = defaultdict(int)
     for entry in entries:
-        for m in mappings:
-            if m["client_ip"] == host_ip and entry["port_start"] <= m["translation_port"] <= entry["port_end"]:
+        for m in client_mapping_index.get(host_ip, []):
+            if entry["external_ip"] == m["translation_ip"] and entry["port_start"] <= m["translation_port"] <= entry["port_end"]:
                 total_ports += 1
                 proto_totals[m.get("protocol", "?")] += 1
 
@@ -399,7 +432,7 @@ def print_enhanced_host_footer(host_ip: str, entries: list[dict], mappings: list
     print(f"  External IPs:          {', '.join(ext_ips)}")
 
 
-def print_enhanced_pool_footer(entries: list[dict], mappings: list[dict], pool_cfg: dict,
+def print_enhanced_pool_footer(entries: list[dict], client_mapping_index: dict[str, list[dict]], pool_cfg: dict,
                                pool_name: str, total_blocks: int, top_n: int = 10):
     """Print enhanced per-pool summary footer with top subscribers and IP distribution."""
     block_size = pool_cfg["block_size"]
@@ -412,8 +445,8 @@ def print_enhanced_pool_footer(entries: list[dict], mappings: list[dict], pool_c
             client_stats[cip] = {"blocks": 0, "ports": 0, "external_ips": set()}
         client_stats[cip]["blocks"] += 1
         client_stats[cip]["external_ips"].add(entry["external_ip"])
-        for m in mappings:
-            if m["client_ip"] == cip and entry["port_start"] <= m["translation_port"] <= entry["port_end"]:
+        for m in client_mapping_index.get(cip, []):
+            if entry["external_ip"] == m["translation_ip"] and entry["port_start"] <= m["translation_port"] <= entry["port_end"]:
                 client_stats[cip]["ports"] += 1
 
     unique_clients = len(client_stats)
@@ -466,7 +499,8 @@ def print_enhanced_pool_footer(entries: list[dict], mappings: list[dict], pool_c
         print(f"    {eip:<20} {cnt:>8} {alloc_pct:>7.1f}%")
 
 
-def show_host(host_ip: str, pba_entries: list[dict], mappings: list[dict], pools: dict,
+def show_host(host_ip: str, pba_entries: list[dict], mapping_index: dict[tuple[str, str], list[dict]],
+              client_mapping_index: dict[str, list[dict]], pools: dict,
               enhanced: bool = False):
     """Display output for a single host IP."""
     host_entries = [e for e in pba_entries if e["client_ip"] == host_ip]
@@ -482,12 +516,13 @@ def show_host(host_ip: str, pba_entries: list[dict], mappings: list[dict], pools
     total_blocks = calc_total_port_blocks(pool_cfg)
     print_pool_header(pool_name, pool_cfg, len(host_entries), total_blocks, per_host=True,
                       enhanced=enhanced)
-    print_pba_rows(host_entries, mappings, pool_cfg["block_size"], enhanced=enhanced)
+    print_pba_rows(host_entries, mapping_index, pool_cfg["block_size"], enhanced=enhanced)
     if enhanced:
-        print_enhanced_host_footer(host_ip, host_entries, mappings, pool_cfg)
+        print_enhanced_host_footer(host_ip, host_entries, client_mapping_index, pool_cfg)
 
 
-def show_pool(pool_name: str, pba_entries: list[dict], mappings: list[dict], pools: dict,
+def show_pool(pool_name: str, pba_entries: list[dict], mapping_index: dict[tuple[str, str], list[dict]],
+              client_mapping_index: dict[str, list[dict]], pools: dict,
               enhanced: bool = False):
     """Display output for all entries in a specific pool."""
     pool_cfg = pools.get(pool_name)
@@ -504,12 +539,13 @@ def show_pool(pool_name: str, pba_entries: list[dict], mappings: list[dict], poo
 
     total_blocks = calc_total_port_blocks(pool_cfg)
     print_pool_header(pool_name, pool_cfg, len(pool_entries), total_blocks, enhanced=enhanced)
-    print_pba_rows(pool_entries, mappings, pool_cfg["block_size"], enhanced=enhanced)
+    print_pba_rows(pool_entries, mapping_index, pool_cfg["block_size"], enhanced=enhanced)
     if enhanced:
-        print_enhanced_pool_footer(pool_entries, mappings, pool_cfg, pool_name, total_blocks)
+        print_enhanced_pool_footer(pool_entries, client_mapping_index, pool_cfg, pool_name, total_blocks)
 
 
-def show_all(pba_entries: list[dict], mappings: list[dict], pools: dict,
+def show_all(pba_entries: list[dict], mapping_index: dict[tuple[str, str], list[dict]],
+             client_mapping_index: dict[str, list[dict]], pools: dict,
              enhanced: bool = False):
     """Show port block info grouped by pool."""
     # Group entries by pool
@@ -527,9 +563,9 @@ def show_all(pba_entries: list[dict], mappings: list[dict], pools: dict,
         pool_cfg = pools.get(pool_name) or unknown_pool_cfg(entries)
         total_blocks = calc_total_port_blocks(pool_cfg)
         print_pool_header(pool_name, pool_cfg, len(entries), total_blocks, enhanced=enhanced)
-        print_pba_rows(entries, mappings, pool_cfg["block_size"], enhanced=enhanced)
+        print_pba_rows(entries, mapping_index, pool_cfg["block_size"], enhanced=enhanced)
         if enhanced:
-            print_enhanced_pool_footer(entries, mappings, pool_cfg, pool_name, total_blocks)
+            print_enhanced_pool_footer(entries, client_mapping_index, pool_cfg, pool_name, total_blocks)
 
 
 def show_summary(pba_entries: list[dict], pools: dict, enhanced: bool = False):
@@ -589,10 +625,14 @@ def show_summary(pba_entries: list[dict], pools: dict, enhanced: bool = False):
 # JSON output builders
 # ---------------------------------------------------------------------------
 
-def build_block_data(entry: dict, mappings: list[dict], block_size: int) -> dict:
+def build_block_data(entry: dict, mapping_index: dict[tuple[str, str], list[dict]], block_size: int) -> dict:
     """Build a dict for a single PBA block entry."""
-    ports_used = count_ports_used(entry["client_ip"], entry["port_start"], entry["port_end"], mappings)
-    proto_counts = count_ports_by_protocol(entry["client_ip"], entry["port_start"], entry["port_end"], mappings)
+    ports_used = count_ports_used(
+        entry["client_ip"], entry["external_ip"], entry["port_start"], entry["port_end"], mapping_index
+    )
+    proto_counts = count_ports_by_protocol(
+        entry["client_ip"], entry["external_ip"], entry["port_start"], entry["port_end"], mapping_index
+    )
     state = determine_block_state(ports_used, entry["ttl"])
     util_pct = (ports_used / block_size * 100) if block_size > 0 else 0
     return {
@@ -611,10 +651,10 @@ def build_block_data(entry: dict, mappings: list[dict], block_size: int) -> dict
 
 
 def build_pool_data(pool_name: str, pool_cfg: dict, entries: list[dict],
-                    mappings: list[dict], total_blocks: int) -> dict:
+                    mapping_index: dict[tuple[str, str], list[dict]], total_blocks: int) -> dict:
     """Build a dict for a pool with all its blocks and enhanced stats."""
     block_size = pool_cfg["block_size"]
-    blocks = [build_block_data(e, mappings, block_size) for e in
+    blocks = [build_block_data(e, mapping_index, block_size) for e in
               sorted(entries, key=lambda e: (e["external_ip"], e["port_start"]))]
 
     # Aggregate per-client stats
@@ -669,7 +709,7 @@ def build_pool_data(pool_name: str, pool_cfg: dict, entries: list[dict],
     }
 
 
-def json_host(host_ip: str, pba_entries: list[dict], mappings: list[dict], pools: dict) -> dict:
+def json_host(host_ip: str, pba_entries: list[dict], mapping_index: dict[tuple[str, str], list[dict]], pools: dict) -> dict:
     """Build JSON data for a single host IP."""
     host_entries = [e for e in pba_entries if e["client_ip"] == host_ip]
     if not host_entries:
@@ -682,7 +722,7 @@ def json_host(host_ip: str, pba_entries: list[dict], mappings: list[dict], pools
 
     block_size = pool_cfg["block_size"]
     total_blocks = calc_total_port_blocks(pool_cfg)
-    blocks = [build_block_data(e, mappings, block_size) for e in
+    blocks = [build_block_data(e, mapping_index, block_size) for e in
               sorted(host_entries, key=lambda e: (e["external_ip"], e["port_start"]))]
 
     total_ports = sum(b["ports_used"] for b in blocks)
@@ -712,7 +752,7 @@ def json_host(host_ip: str, pba_entries: list[dict], mappings: list[dict], pools
     }
 
 
-def json_pool(pool_name: str, pba_entries: list[dict], mappings: list[dict], pools: dict) -> dict:
+def json_pool(pool_name: str, pba_entries: list[dict], mapping_index: dict[tuple[str, str], list[dict]], pools: dict) -> dict:
     """Build JSON data for a specific pool."""
     pool_cfg = pools.get(pool_name)
     if not pool_cfg:
@@ -723,12 +763,12 @@ def json_pool(pool_name: str, pba_entries: list[dict], mappings: list[dict], poo
         return {"error": f"No port block allocations found for pool {pool_name}"}
 
     total_blocks = calc_total_port_blocks(pool_cfg)
-    result = build_pool_data(pool_name, pool_cfg, pool_entries, mappings, total_blocks)
+    result = build_pool_data(pool_name, pool_cfg, pool_entries, mapping_index, total_blocks)
     result["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return result
 
 
-def json_xlated_ip(xlated_ip: str, pba_entries: list[dict], mappings: list[dict], pools: dict) -> dict:
+def json_xlated_ip(xlated_ip: str, pba_entries: list[dict], mapping_index: dict[tuple[str, str], list[dict]], pools: dict) -> dict:
     """Build JSON data filtered by translated IP."""
     filtered = [e for e in pba_entries if e["external_ip"] == xlated_ip]
     if not filtered:
@@ -740,13 +780,13 @@ def json_xlated_ip(xlated_ip: str, pba_entries: list[dict], mappings: list[dict]
         pool_name = "Unknown"
 
     total_blocks = calc_total_port_blocks(pool_cfg)
-    result = build_pool_data(pool_name, pool_cfg, filtered, mappings, total_blocks)
+    result = build_pool_data(pool_name, pool_cfg, filtered, mapping_index, total_blocks)
     result["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     result["filtered_by"] = xlated_ip
     return result
 
 
-def json_all(pba_entries: list[dict], mappings: list[dict], pools: dict) -> dict:
+def json_all(pba_entries: list[dict], mapping_index: dict[tuple[str, str], list[dict]], pools: dict) -> dict:
     """Build JSON data for all pools."""
     pool_groups: dict[str, list[dict]] = defaultdict(list)
     for entry in pba_entries:
@@ -758,7 +798,7 @@ def json_all(pba_entries: list[dict], mappings: list[dict], pools: dict) -> dict
         entries = pool_groups[pool_name]
         pool_cfg = pools.get(pool_name) or unknown_pool_cfg(entries)
         total_blocks = calc_total_port_blocks(pool_cfg)
-        pool_data.append(build_pool_data(pool_name, pool_cfg, entries, mappings, total_blocks))
+        pool_data.append(build_pool_data(pool_name, pool_cfg, entries, mapping_index, total_blocks))
 
     return {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -804,6 +844,9 @@ def json_summary(pba_entries: list[dict], pools: dict) -> dict:
 
 
 def main():
+    script_start = time.time()
+    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Starting CGNAT PBA Stats script (lsndb)", file=sys.stderr)
+
     parser = argparse.ArgumentParser(
         description="Query F5 BIG-IP CGNAT PBA stats"
     )
@@ -812,7 +855,9 @@ def main():
     parser.add_argument("--port", default="22", metavar="PORT",
                         help="SSH port (default: 22)")
     parser.add_argument("--user", metavar="USERNAME",
-                        help="SSH username (prompts for password)")
+                        help="SSH username; prompts for password unless --key-file is set")
+    parser.add_argument("--key-file", metavar="FILE",
+                        help="SSH private key file for publickey authentication")
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("host_ip", nargs="?", help="Client/subscriber IP to query")
@@ -832,12 +877,18 @@ def main():
 
     username = args.user
     password = None
-    if username:
+    key_file = os.path.expanduser(args.key_file) if args.key_file else None
+    if username and not key_file:
         password = getpass.getpass(f"Password for {username}@{args.bigip}: ")
+    if key_file and not os.path.isfile(key_file):
+        print(f"ERROR: SSH key file not found: {key_file}", file=sys.stderr)
+        sys.exit(1)
 
     try:
-        ssh_connect(args.bigip, int(args.port), username=username, password=password,
-                    no_host_key_check=args.no_host_key_check)
+        with Timer("SSH connection establishment"):
+            ssh_connect(args.bigip, int(args.port), username=username,
+                        password=password, key_filename=key_file,
+                        no_host_key_check=args.no_host_key_check)
     except Exception as e:
         print(f"ERROR: Cannot connect to {args.bigip}:{args.port} - {e}", file=sys.stderr)
         sys.exit(1)
@@ -849,11 +900,11 @@ def main():
         if not use_json:
             print(msg, file=sys.stderr)
 
-    log("Fetching pool configurations...")
-    pools = get_pool_configs()
+    with Timer("Fetching pool configurations"):
+        pools = get_pool_configs()
 
-    log("Fetching PBA entries...")
-    pba_entries = get_pba_entries()
+    with Timer("Fetching PBA entries"):
+        pba_entries = get_pba_entries()
 
     if not pba_entries:
         if use_json:
@@ -866,44 +917,53 @@ def main():
         if args.summary:
             result = json_summary(pba_entries, pools)
         else:
-            mappings = get_inbound_mappings()
+            with Timer("Fetching inbound mappings"):
+                mappings = get_inbound_mappings()
+            mapping_index, client_mapping_index = build_mapping_indexes(mappings)
             if args.pool:
-                result = json_pool(args.pool, pba_entries, mappings, pools)
+                result = json_pool(args.pool, pba_entries, mapping_index, pools)
             elif args.xlated_ip:
-                result = json_xlated_ip(args.xlated_ip, pba_entries, mappings, pools)
+                result = json_xlated_ip(args.xlated_ip, pba_entries, mapping_index, pools)
             elif args.all:
-                result = json_all(pba_entries, mappings, pools)
+                result = json_all(pba_entries, mapping_index, pools)
             else:
-                result = json_host(args.host_ip, pba_entries, mappings, pools)
+                result = json_host(args.host_ip, pba_entries, mapping_index, pools)
         print(json.dumps(result, separators=(",", ":")))
     elif args.summary:
-        show_summary(pba_entries, pools, enhanced=enhanced)
+        with Timer("Processing and displaying summary"):
+            show_summary(pba_entries, pools, enhanced=enhanced)
     else:
-        log("Fetching inbound mappings (port usage)...")
-        mappings = get_inbound_mappings()
+        with Timer("Fetching inbound mappings (port usage)"):
+            mappings = get_inbound_mappings()
+        mapping_index, client_mapping_index = build_mapping_indexes(mappings)
 
-        if args.pool:
-            show_pool(args.pool, pba_entries, mappings, pools, enhanced=enhanced)
-        elif args.xlated_ip:
-            filtered = [e for e in pba_entries if e["external_ip"] == args.xlated_ip]
-            if not filtered:
-                print(f"No port block allocations found for translated IP {args.xlated_ip}")
+        with Timer("Processing and displaying results"):
+            if args.pool:
+                show_pool(args.pool, pba_entries, mapping_index, client_mapping_index, pools, enhanced=enhanced)
+            elif args.xlated_ip:
+                filtered = [e for e in pba_entries if e["external_ip"] == args.xlated_ip]
+                if not filtered:
+                    print(f"No port block allocations found for translated IP {args.xlated_ip}")
+                else:
+                    pool_name, pool_cfg = find_pool_for_ip(args.xlated_ip, pools)
+                    if not pool_cfg:
+                        pool_cfg = unknown_pool_cfg(filtered)
+                        pool_name = "Unknown"
+                    total_blocks = calc_total_port_blocks(pool_cfg)
+                    print_pool_header(pool_name, pool_cfg, len(filtered), total_blocks,
+                                      enhanced=enhanced)
+                    print_pba_rows(filtered, mapping_index, pool_cfg["block_size"], enhanced=enhanced)
+                    if enhanced:
+                        print_enhanced_pool_footer(filtered, client_mapping_index, pool_cfg, pool_name,
+                                                  total_blocks)
+            elif args.all:
+                show_all(pba_entries, mapping_index, client_mapping_index, pools, enhanced=enhanced)
             else:
-                pool_name, pool_cfg = find_pool_for_ip(args.xlated_ip, pools)
-                if not pool_cfg:
-                    pool_cfg = unknown_pool_cfg(filtered)
-                    pool_name = "Unknown"
-                total_blocks = calc_total_port_blocks(pool_cfg)
-                print_pool_header(pool_name, pool_cfg, len(filtered), total_blocks,
-                                  enhanced=enhanced)
-                print_pba_rows(filtered, mappings, pool_cfg["block_size"], enhanced=enhanced)
-                if enhanced:
-                    print_enhanced_pool_footer(filtered, mappings, pool_cfg, pool_name,
-                                              total_blocks)
-        elif args.all:
-            show_all(pba_entries, mappings, pools, enhanced=enhanced)
-        else:
-            show_host(args.host_ip, pba_entries, mappings, pools, enhanced=enhanced)
+                show_host(args.host_ip, pba_entries, mapping_index, client_mapping_index, pools, enhanced=enhanced)
+
+    script_end = time.time()
+    total_duration = script_end - script_start
+    print(f"\n[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Script completed in {total_duration:.3f}s", file=sys.stderr)
 
 
 if __name__ == "__main__":

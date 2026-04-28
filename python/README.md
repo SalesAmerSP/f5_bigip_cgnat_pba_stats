@@ -13,14 +13,15 @@ python cgnat_pba_stats.py --bigip 10.0.0.1 --pool POOL_NAME
 python cgnat_pba_stats.py --bigip 10.0.0.1 --xlated-ip 198.51.100.1
 python cgnat_pba_stats.py --bigip 10.0.0.1 --all
 python cgnat_pba_stats.py --bigip 10.0.0.1 --summary
-python cgnat_pba_stats.py --bigip 10.0.0.1 --user admin --all   # prompts for password
-python cgnat_pba_stats.py --bigip 10.0.0.1 --port 47001 --all   # custom SSH port
+python cgnat_pba_stats.py --bigip 10.0.0.1 --user admin --all   # prompts for password when key file is not provided
+python cgnat_pba_stats.py --bigip 10.0.0.1 --user admin --key-file ~/.ssh/id_rsa --all   # SSH key authentication
+python cgnat_pba_stats.py --bigip 10.0.0.1 --port 47001 --user admin --key-file ~/.ssh/id_rsa --all   # custom SSH port and key auth
 python cgnat_pba_stats.py --bigip 10.0.0.1 --all --no-host-key-check  # skip host key verification
 ```
 
 ### cgnat_pba_stats_bigip_compatible.py
 
-Same functionality as `cgnat_pba_stats.py` but designed to run directly on the BIG-IP. Calls `lsndb` and `tmsh` locally without SSH. Compatible with BIG-IP's Python 3.8.
+Same functionality as `cgnat_pba_stats.py` but designed to run directly on the BIG-IP. Calls `lsndb` and `tmsh` locally without SSH. Compatible with BIG-IP's Python 3.8 and uses only the standard library.
 
 ```bash
 pba-stats <host_ip>
@@ -66,6 +67,42 @@ echo 'export PATH=/shared/scripts:$PATH' > /etc/profile.d/pba-stats.sh
 
 </details>
 
+### cgnat_api_stats.py
+
+Alternative monitoring script that uses SSH/tmsh instead of lsndb commands. Provides aggregate statistics only — **does not provide per-subscriber details**.
+
+**⚠️ LIMITATION**: This script demonstrates API-based monitoring but currently shows mock data. The iControl REST API provides only aggregate PBA statistics and cannot replace lsndb for detailed subscriber analysis.
+
+```bash
+python cgnat_api_stats.py --bigip 10.0.0.1 --pool POOL_NAME
+python cgnat_api_stats.py --bigip 10.0.0.1 --user admin --key-file ~/.ssh/id_rsa --pool POOL_NAME
+```
+
+## Performance Comparison
+
+Testing with a pool containing 11 active subscribers:
+
+| Script                        | Total Time   | Data Detail Level        | Use Case                          |
+|-------------------------------|--------------|--------------------------|-----------------------------------|
+| `cgnat_pba_stats.py` (lsndb)  | ~11 seconds  | Per-subscriber details   | Troubleshooting, detailed analysis |
+| `cgnat_api_stats.py` (API)    | ~3 seconds   | Aggregate statistics only | Monitoring, alerting              |
+
+**Key Findings:**
+
+- **lsndb approach**: Provides complete subscriber data (client IPs, port ranges, TTLs, connection details) but slower due to parsing large lsndb output
+- **API approach**: 3x faster but lacks critical per-subscriber information required for troubleshooting
+- **Recommendation**: Use API for high-level monitoring/alerting; use lsndb for detailed subscriber analysis
+
+**Missing from API:**
+
+- Individual client IP mappings
+- Port block ranges (start-end)
+- Subscriber ID strings
+- TTL values for allocations
+- Individual connection mappings
+- Protocol breakdown per connection
+- Connection age information
+
 ### cgnat_pba_collect.py
 
 Data collector that aggregates per-subscriber PBA statistics and exports to CSV or MySQL. Designed for periodic collection (e.g., cron).
@@ -84,6 +121,7 @@ python cgnat_pba_collect.py --bigip 10.0.0.1 --output mysql \
 
 # With SSH credentials
 python cgnat_pba_collect.py --bigip 10.0.0.1 --user admin --output csv
+python cgnat_pba_collect.py --bigip 10.0.0.1 --user admin --key-file ~/.ssh/id_rsa --output csv
 
 # Skip host key verification
 python cgnat_pba_collect.py --bigip 10.0.0.1 --output csv --no-host-key-check
