@@ -167,6 +167,52 @@ Host_IP                       External_IP                    Port_Block  Ports_U
 - **Active** - Ports currently in use
 - **Query** - Block allocated but no active ports, TTL still running
 - **Inactive** - Block expired (TTL = 0, no ports in use)
+- **Alloc** - Fast-mode only: block allocated, active/inactive unknown (no inbound data)
+
+## Fast Mode (large deployments)
+
+On deployments with 10,000+ subscribers, `lsndb list inbound` can enumerate millions of active flow entries and take 20–30 minutes to complete. Add `--fast` to skip this call:
+
+```bash
+# On-device (bigip_compatible) - skip inbound, show blocks without port counts
+pba-stats --all --fast
+pba-stats --pool MyPool --fast --json
+
+# --summary --fast is even faster: uses tmctl (instant) + lsndb summary pba
+# instead of lsndb list pba entirely
+pba-stats --summary --fast
+pba-stats --summary --fast --json
+```
+
+```bash
+# Remote script
+python cgnat_pba_stats.py --bigip 10.0.0.1 --all --fast
+python cgnat_pba_stats.py --bigip 10.0.0.1 --summary --fast --json
+```
+
+### What `--fast` changes
+
+| Feature | Normal | `--fast` |
+| --- | --- | --- |
+| `lsndb list inbound` called | Yes | No |
+| `lsndb list pba` called | Yes | Yes (except `--summary --fast`) |
+| `tmctl fw_lsn_pool_pba_stat` called | No | Yes (for `--summary` only) |
+| Ports_Used column | Actual count | `-` |
+| Block_State | Active / Query / Inactive | Alloc / Query (TTL-based) |
+| Protocol breakdown | Yes | No (shown as `-`) |
+| Per-pool client count | Yes | `-` (total shown at bottom) |
+
+### JSON schema in fast mode
+
+Fast-mode JSON includes `"fast_mode": true` at the root. Fields that require inbound data are set to `null`:
+
+- `ports_used: null` per block
+- `utilization_pct: null` per block and per client
+- `total_ports_used: null` per pool
+- `port_utilization_pct: null` per pool
+- `clients: null` per pool (summary fast mode)
+
+Consumers should check `fast_mode` and handle `null` accordingly.
 
 ## Enhanced Mode
 
