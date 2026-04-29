@@ -22,22 +22,25 @@ from datetime import datetime
 
 import paramiko
 
+_timing: bool = False
+
 
 class Timer:
-    """Simple timing context manager."""
+    """Timing context manager. Only prints when --timing is active."""
     def __init__(self, description: str):
         self.description = description
         self.start_time = None
 
     def __enter__(self):
-        self.start_time = time.time()
-        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Starting: {self.description}", file=sys.stderr)
+        if _timing:
+            self.start_time = time.time()
+            print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Starting: {self.description}", file=sys.stderr)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        end_time = time.time()
-        duration = end_time - self.start_time
-        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Completed: {self.description} ({duration:.3f}s)", file=sys.stderr)
+        if _timing and self.start_time is not None:
+            duration = time.time() - self.start_time
+            print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Completed: {self.description} ({duration:.3f}s)", file=sys.stderr)
 
 
 SSH_CLIENT: paramiko.SSHClient | None = None
@@ -965,9 +968,6 @@ def json_summary(pba_entries: list[dict], pools: dict) -> dict:
 
 
 def main():
-    script_start = time.time()
-    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Starting CGNAT PBA Stats script (lsndb)", file=sys.stderr)
-
     parser = argparse.ArgumentParser(
         description="Query F5 BIG-IP CGNAT PBA stats"
     )
@@ -999,8 +999,16 @@ def main():
                             "For --summary, uses tmctl instead of lsndb list pba entirely. "
                             "Dramatically faster on deployments with 10k+ subscribers."
                         ))
+    parser.add_argument("--timing", action="store_true",
+                        help="Print timing diagnostics to stderr (start/stop timestamps and durations)")
 
     args = parser.parse_args()
+
+    global _timing
+    _timing = args.timing
+    script_start = time.time()
+    if _timing:
+        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Starting CGNAT PBA Stats script (lsndb)", file=sys.stderr)
 
     username = args.user
     password = None
@@ -1051,7 +1059,8 @@ def main():
             else:
                 show_fast_summary(pools, tmctl_stats, client_summary, enhanced=enhanced)
         script_end = time.time()
-        print(f"\n[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Script completed in {script_end - script_start:.3f}s", file=sys.stderr)
+        if _timing:
+            print(f"\n[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Script completed in {script_end - script_start:.3f}s", file=sys.stderr)
         return
 
     with Timer("Fetching pool configurations"):
@@ -1075,7 +1084,8 @@ def main():
             else:
                 show_summary(pba_entries, pools, enhanced=enhanced)
         script_end = time.time()
-        print(f"\n[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Script completed in {script_end - script_start:.3f}s", file=sys.stderr)
+        if _timing:
+            print(f"\n[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Script completed in {script_end - script_start:.3f}s", file=sys.stderr)
         return
 
     # All other modes: optionally fetch inbound mappings
@@ -1127,9 +1137,9 @@ def main():
             else:
                 show_host(args.host_ip, pba_entries, mapping_index, client_mapping_index, pools, enhanced=enhanced)
 
-    script_end = time.time()
-    total_duration = script_end - script_start
-    print(f"\n[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Script completed in {total_duration:.3f}s", file=sys.stderr)
+    if _timing:
+        script_end = time.time()
+        print(f"\n[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Script completed in {script_end - script_start:.3f}s", file=sys.stderr)
 
 
 if __name__ == "__main__":

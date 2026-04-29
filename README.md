@@ -39,7 +39,7 @@ F5 BIG-IP CGNAT uses PBA to allocate port blocks to subscribers. BIG-IP does not
 | `tmsh list security nat source-translation one-line` | Pool configuration (block size, client block limit, address ranges) |
 | `tmctl fw_lsn_pool_pba_stat` | Per-pool block counts direct from TMM (used by `--summary --fast`) |
 
-`lsndb list inbound` enumerates every active NAT flow and can take 20–30 minutes on deployments with 10,000+ subscribers. Use `--fast` to skip it; see [python/README.md](python/README.md) for details.
+`lsndb list inbound` enumerates every active NAT flow and can take 20–30 minutes on deployments with 10,000+ subscribers. Use `--fast` to skip it. Add `--timing` to print per-phase timestamps and elapsed times to stderr. See [python/README.md](python/README.md) for details on both flags.
 
 ## Security
 

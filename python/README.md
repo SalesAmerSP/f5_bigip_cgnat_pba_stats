@@ -80,20 +80,18 @@ python cgnat_api_stats.py --bigip 10.0.0.1 --user admin --key-file ~/.ssh/id_rsa
 
 ## Performance Comparison
 
-Testing with a pool containing 11 active subscribers:
+Lab test with a pool containing 11 active subscribers (times scale with subscriber count):
 
-| Script                        | Total Time   | Data Detail Level        | Use Case                          |
-|-------------------------------|--------------|--------------------------|-----------------------------------|
-| `cgnat_pba_stats.py` (lsndb)  | ~11 seconds  | Per-subscriber details   | Troubleshooting, detailed analysis |
-| `cgnat_api_stats.py` (API)    | ~3 seconds   | Aggregate statistics only | Monitoring, alerting              |
+| Script                        | Total Time   | Data Detail Level         | Use Case                           |
+|-------------------------------|--------------|---------------------------|------------------------------------|
+| `cgnat_pba_stats.py` (lsndb)  | ~11 seconds  | Per-subscriber details    | Troubleshooting, detailed analysis |
+| `cgnat_api_stats.py` (API)    | ~3 seconds   | Aggregate statistics only | Monitoring, alerting               |
 
-**Key Findings:**
+- **lsndb approach**: Provides complete subscriber data (client IPs, port ranges, TTLs, connection details). On large deployments (10k+ subscribers), use `--fast` to reduce collection time significantly.
+- **API approach**: 3x faster but lacks per-subscriber detail required for troubleshooting.
+- **Recommendation**: Use the API script for high-level monitoring/alerting; use lsndb for detailed subscriber analysis.
 
-- **lsndb approach**: Provides complete subscriber data (client IPs, port ranges, TTLs, connection details) but slower due to parsing large lsndb output
-- **API approach**: 3x faster but lacks critical per-subscriber information required for troubleshooting
-- **Recommendation**: Use API for high-level monitoring/alerting; use lsndb for detailed subscriber analysis
-
-**Missing from API:**
+**Missing from the API script:**
 
 - Individual client IP mappings
 - Port block ranges (start-end)
@@ -118,6 +116,15 @@ python cgnat_pba_collect.py --bigip 10.0.0.1 --output csv --csv-file /path/to/ou
 python cgnat_pba_collect.py --bigip 10.0.0.1 --output mysql \
     --db-host localhost --db-name cgnat \
     --db-user root --db-pass changeme
+
+# Override device name stored in the DB record (default: bigip01)
+python cgnat_pba_collect.py --bigip 10.0.0.1 --output mysql --device my-cgnat-01 \
+    --db-host localhost --db-name cgnat --db-user root --db-pass changeme
+
+# Override MySQL port or table name
+python cgnat_pba_collect.py --bigip 10.0.0.1 --output mysql \
+    --db-host localhost --db-port 3307 --db-name cgnat \
+    --db-table pba_stats_prod --db-user root --db-pass changeme
 
 # With SSH credentials
 python cgnat_pba_collect.py --bigip 10.0.0.1 --user admin --output csv
@@ -272,6 +279,33 @@ JSON output is compact (not pretty-printed) for use in API calls and scripting. 
 - **Host mode**: `host_ip`, `pool_name`, `blocks_allocated`, `blocks_remaining`, `utilization_pct`, `protocol_totals`, `blocks[]`
 - **Pool / xlated-ip / all mode**: Per-pool objects with `blocks[]`, `clients[]`, `external_ip_distribution`
 - **Summary mode**: `pools[]` with `clients`, `blocks_used`, `blocks_total`, `pool_utilization_pct`, `avg_blocks_per_client`
+
+## Timing Diagnostics
+
+> Available in `cgnat_pba_stats.py` and `cgnat_pba_stats_bigip_compatible.py`.
+
+Add `--timing` to print per-phase start/stop timestamps and elapsed times to stderr:
+
+```bash
+python cgnat_pba_stats.py --bigip 10.0.0.1 --summary --timing
+pba-stats --all --fast --timing
+```
+
+Sample stderr output:
+
+```text
+[14:02:31.443] Starting CGNAT PBA Stats script (lsndb)
+[14:02:31.443] Starting: SSH connection establishment
+[14:02:31.897] Completed: SSH connection establishment (0.454s)
+[14:02:31.897] Starting: Fetching pool configurations
+[14:02:32.014] Completed: Fetching pool configurations (0.117s)
+[14:02:32.014] Starting: Fetching PBA entries
+[14:02:34.291] Completed: Fetching PBA entries (2.277s)
+
+[14:02:34.292] Script completed in 2.849s
+```
+
+Timing output goes to stderr so it does not interfere with `--json` consumers or shell pipelines. Without `--timing`, no diagnostic output is produced.
 
 ## Requirements
 

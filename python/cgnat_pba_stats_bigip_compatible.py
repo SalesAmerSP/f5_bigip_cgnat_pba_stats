@@ -26,8 +26,29 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from collections import defaultdict
 from datetime import datetime
+
+_timing = False
+
+
+class Timer:
+    """Timing context manager. Only prints when --timing is active."""
+    def __init__(self, description):
+        self.description = description
+        self.start_time = None
+
+    def __enter__(self):
+        if _timing:
+            self.start_time = time.time()
+            print("[%s] Starting: %s" % (datetime.now().strftime("%H:%M:%S.%f")[:-3], self.description), file=sys.stderr)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if _timing and self.start_time is not None:
+            duration = time.time() - self.start_time
+            print("[%s] Completed: %s (%.3fs)" % (datetime.now().strftime("%H:%M:%S.%f")[:-3], self.description, duration), file=sys.stderr)
 
 
 def run_cmd(cmd, timeout=30):
@@ -887,19 +908,31 @@ def main():
                             "For --summary, uses tmctl instead of lsndb list pba entirely. "
                             "Dramatically faster on deployments with 10k+ subscribers."
                         ))
+    parser.add_argument("--timing", action="store_true",
+                        help="Print timing diagnostics to stderr (start/stop timestamps and durations)")
 
     args = parser.parse_args()
+
+    global _timing
+    _timing = args.timing
+    script_start = time.time()
+    if _timing:
+        print("[%s] Starting CGNAT PBA Stats script (lsndb)" % datetime.now().strftime("%H:%M:%S.%f")[:-3], file=sys.stderr)
+
     enhanced = args.enhanced
     use_json = args.json
     fast_mode = args.fast
 
     # --summary --fast: bypass lsndb entirely using tmctl + lsndb summary pba
     if args.summary and fast_mode:
-        pools = get_pool_configs()
-        tmctl_stats = get_tmctl_pool_stats()
+        with Timer("Fetching pool configurations"):
+            pools = get_pool_configs()
+        with Timer("Fetching tmctl pool stats (fast path)"):
+            tmctl_stats = get_tmctl_pool_stats()
         if not tmctl_stats:
             # tmctl unavailable (older TMOS?) — fall back to normal summary path
-            pba_entries = get_pba_entries()
+            with Timer("Fetching PBA entries (tmctl unavailable, falling back)"):
+                pba_entries = get_pba_entries()
             if not pba_entries:
                 print("No PBA entries found.")
                 sys.exit(0)
@@ -907,17 +940,23 @@ def main():
                 print(json.dumps(json_summary(pba_entries, pools), separators=(",", ":")))
             else:
                 show_summary(pba_entries, pools, enhanced=enhanced)
+            if _timing:
+                print("\n[%s] Script completed in %.3fs" % (datetime.now().strftime("%H:%M:%S.%f")[:-3], time.time() - script_start), file=sys.stderr)
             return
-        client_summary = get_pba_client_summary()
+        with Timer("Fetching subscriber count summary"):
+            client_summary = get_pba_client_summary()
         if use_json:
             print(json.dumps(json_fast_summary(pools, tmctl_stats, client_summary), separators=(",", ":")))
         else:
             show_fast_summary(pools, tmctl_stats, client_summary, enhanced=enhanced)
+        if _timing:
+            print("\n[%s] Script completed in %.3fs" % (datetime.now().strftime("%H:%M:%S.%f")[:-3], time.time() - script_start), file=sys.stderr)
         return
 
     # --summary (normal): pba entries only, no inbound; run tmsh + lsndb concurrently
     if args.summary:
-        pools, pba_entries, _ = _collect_parallel(want_inbound=False)
+        with Timer("Fetching pool configs and PBA entries"):
+            pools, pba_entries, _ = _collect_parallel(want_inbound=False)
         if not pba_entries:
             print("No PBA entries found.")
             sys.exit(0)
@@ -925,11 +964,14 @@ def main():
             print(json.dumps(json_summary(pba_entries, pools), separators=(",", ":")))
         else:
             show_summary(pba_entries, pools, enhanced=enhanced)
+        if _timing:
+            print("\n[%s] Script completed in %.3fs" % (datetime.now().strftime("%H:%M:%S.%f")[:-3], time.time() - script_start), file=sys.stderr)
         return
 
     # All other modes: run tmsh + lsndb pba + (optionally) lsndb inbound concurrently
     want_inbound = not fast_mode
-    pools, pba_entries, mappings = _collect_parallel(want_inbound=want_inbound)
+    with Timer("Fetching pool configs, PBA entries%s" % (" and inbound mappings" if want_inbound else "")):
+        pools, pba_entries, mappings = _collect_parallel(want_inbound=want_inbound)
 
     if not pba_entries:
         print("No PBA entries found.")
@@ -978,6 +1020,9 @@ def main():
         show_all(pba_entries, mapping_index, client_mapping_index, pools, enhanced=enhanced)
     else:
         show_host(args.host_ip, pba_entries, mapping_index, client_mapping_index, pools, enhanced=enhanced)
+
+    if _timing:
+        print("\n[%s] Script completed in %.3fs" % (datetime.now().strftime("%H:%M:%S.%f")[:-3], time.time() - script_start), file=sys.stderr)
 
 
 if __name__ == "__main__":
