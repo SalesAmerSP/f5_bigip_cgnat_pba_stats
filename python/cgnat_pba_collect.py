@@ -97,6 +97,7 @@ def ssh_command(cmd: str, timeout: int = 30) -> str:
     global SSH_CLIENT
     assert SSH_CLIENT is not None, "SSH connection not established"
     client = SSH_CLIENT
+    stdout = stderr = None
     try:
         _, stdout, stderr = client.exec_command(cmd, timeout=timeout)
     except paramiko.SSHException:
@@ -118,6 +119,7 @@ def ssh_command(cmd: str, timeout: int = 30) -> str:
                 last_err = e
         if last_err is not None:
             raise last_err
+    assert stdout is not None and stderr is not None
     output = stdout.read().decode() or stderr.read().decode() or ""
     lines = output.strip().split("\n")
     if len(lines) > 2:
@@ -223,7 +225,7 @@ def find_pool_for_ip(external_ip: str, pools: dict) -> str | None:
                     parts = addr_str.split("-")
                     start = ipaddress.ip_address(parts[0].strip())
                     end = ipaddress.ip_address(parts[1].strip())
-                    if start <= ext <= end:
+                    if int(start) <= int(ext) <= int(end):
                         return pool_name
                 elif "/" in addr_str:
                     net = ipaddress.ip_network(addr_str, strict=False)
