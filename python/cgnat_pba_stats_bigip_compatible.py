@@ -364,7 +364,7 @@ def print_pool_header(pool_name, pool_cfg, used_blocks, total_blocks, per_host=F
 
 
 def print_pba_rows(entries, mapping_index, block_size, enhanced=False):
-    entries.sort(key=lambda e: (e["external_ip"], e["port_start"]))
+    entries.sort(key=lambda e: (int(ipaddress.ip_address(e["external_ip"])), e["port_start"]))
     for entry in entries:
         port_range = "%d-%d" % (entry["port_start"], entry["port_end"])
         ports_used = count_ports_used(
@@ -470,7 +470,7 @@ def print_enhanced_pool_footer(entries, mapping_index, pool_cfg, pool_name, tota
             ext_str = ", ".join(sorted(stats["external_ips"]))
             print("    %-20s %8d %8d %7.1f%%  %s" % (cip, stats["ports"], stats["blocks"], u, ext_str))
 
-    top_by_blocks = sorted(client_stats.items(), key=lambda x: x[1]["blocks"], reverse=True)[:top_n]
+    top_by_blocks = sorted(client_stats.items(), key=lambda x: (x[1]["blocks"], x[1]["ports"]), reverse=True)[:top_n]
     print()
     print("  Top %d subscribers by block count:" % min(top_n, len(top_by_blocks)))
     print("    %-20s %8s %8s %8s" % ("Client_IP", "Blocks", "Ports", "Util%"))

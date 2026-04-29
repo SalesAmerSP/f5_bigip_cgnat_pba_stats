@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import getpass
+import ipaddress
 import json
 import os
 import re
@@ -280,8 +281,6 @@ def find_pool_for_ip(external_ip: str, pools: dict) -> tuple[str, dict]:
     """Find which source-translation pool an external IP belongs to.
     Returns (pool_name, pool_config) or (None, None).
     """
-    import ipaddress
-
     ext = ipaddress.ip_address(external_ip)
     for pool_name, pool_cfg in pools.items():
         for addr_str in pool_cfg["addresses"]:
@@ -375,7 +374,6 @@ def filter_entries_by_pool(pba_entries: list[dict], pool_name: str, pools: dict)
 
 def calc_total_port_blocks(pool_cfg: dict) -> int:
     """Calculate total possible port blocks for a pool based on address space and block size."""
-    import ipaddress
     total_ips = 0
     for addr_str in pool_cfg["addresses"]:
         addr_str = addr_str.strip()
@@ -429,7 +427,7 @@ def print_pool_header(pool_name: str, pool_cfg: dict, used_blocks: int, total_bl
 def print_pba_rows(entries: list[dict], mapping_index,
                    block_size: int, enhanced: bool = False):
     """Print PBA entry rows sorted by external_ip then port_start."""
-    entries.sort(key=lambda e: (e["external_ip"], e["port_start"]))
+    entries.sort(key=lambda e: (int(ipaddress.ip_address(e["external_ip"])), e["port_start"]))
     for entry in entries:
         port_range = f"{entry['port_start']}-{entry['port_end']}"
         ports_used = count_ports_used(
@@ -537,7 +535,7 @@ def print_enhanced_pool_footer(entries: list[dict], mapping_index,
             ext_str = ", ".join(sorted(stats["external_ips"]))
             print(f"    {cip:<20} {stats['ports']:>8} {stats['blocks']:>8} {u:>7.1f}%  {ext_str}")
 
-    top_by_blocks = sorted(client_stats.items(), key=lambda x: x[1]["blocks"], reverse=True)[:top_n]
+    top_by_blocks = sorted(client_stats.items(), key=lambda x: (x[1]["blocks"], x[1]["ports"]), reverse=True)[:top_n]
     print(f"\n  Top {min(top_n, len(top_by_blocks))} subscribers by block count:")
     print(f"    {'Client_IP':<20} {'Blocks':>8} {'Ports':>8} {'Util%':>8}")
     for cip, stats in top_by_blocks:
