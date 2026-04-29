@@ -70,6 +70,7 @@ def _do_ssh_connect():
     """Internal: create and connect SSH client using stored params."""
     global SSH_CLIENT
     params = SSH_CONNECT_PARAMS
+    assert params is not None, "ssh_connect() must be called before _do_ssh_connect()"
     SSH_CLIENT = paramiko.SSHClient()
     if params["no_host_key_check"]:
         SSH_CLIENT.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -95,11 +96,12 @@ def ssh_command(cmd: str, timeout: int = 30) -> str:
     import time
     global SSH_CLIENT
     assert SSH_CLIENT is not None, "SSH connection not established"
+    client = SSH_CLIENT
     try:
-        _, stdout, stderr = SSH_CLIENT.exec_command(cmd, timeout=timeout)
+        _, stdout, stderr = client.exec_command(cmd, timeout=timeout)
     except paramiko.SSHException:
         try:
-            SSH_CLIENT.close()
+            client.close()
         except Exception:
             pass
         last_err = None
@@ -107,7 +109,9 @@ def ssh_command(cmd: str, timeout: int = 30) -> str:
             try:
                 time.sleep(1 + attempt)
                 _do_ssh_connect()
-                _, stdout, stderr = SSH_CLIENT.exec_command(cmd, timeout=timeout)
+                assert SSH_CLIENT is not None
+                client = SSH_CLIENT
+                _, stdout, stderr = client.exec_command(cmd, timeout=timeout)
                 last_err = None
                 break
             except Exception as e:
@@ -375,6 +379,7 @@ def export_mysql(rows: list[dict], timestamp: str, device: str,
         host=db_host, port=db_port, database=db_name,
         user=db_user, password=db_pass,
     )
+    cursor = None
     try:
         cursor = conn.cursor()
         cursor.execute(CREATE_TABLE_SQL.format(table=db_table))
@@ -392,7 +397,8 @@ def export_mysql(rows: list[dict], timestamp: str, device: str,
         conn.commit()
         print(f"Inserted {count} rows into {db_name}.{db_table}", file=sys.stderr)
     finally:
-        cursor.close()
+        if cursor is not None:
+            cursor.close()
         conn.close()
 
 # ---------------------------------------------------------------------------
