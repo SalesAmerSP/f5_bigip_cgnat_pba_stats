@@ -18,6 +18,7 @@ import argparse
 import csv
 import getpass
 import ipaddress
+import os
 import re
 import sys
 from collections import defaultdict
@@ -51,13 +52,15 @@ CSV_FILE = None  # None = stdout
 # ---------------------------------------------------------------------------
 
 def ssh_connect(host: str, port: int, username: str | None = None,
-                password: str | None = None, no_host_key_check: bool = False):
+                password: str | None = None, key_filename: str | None = None,
+                no_host_key_check: bool = False):
     """Establish a persistent SSH connection to the BIG-IP."""
     global SSH_CONNECT_PARAMS
     SSH_CONNECT_PARAMS = {
         "hostname": host, "port": port, "username": username,
-        "password": password, "timeout": 10,
-        "allow_agent": password is None, "look_for_keys": password is None,
+        "password": password, "key_filename": key_filename, "timeout": 10,
+        "allow_agent": password is None,
+        "look_for_keys": password is None and key_filename is None,
         "no_host_key_check": no_host_key_check,
     }
     _do_ssh_connect()
@@ -76,7 +79,7 @@ def _do_ssh_connect():
     SSH_CLIENT.connect(
         hostname=params["hostname"], port=params["port"],
         username=params["username"], password=params["password"],
-        timeout=params["timeout"],
+        key_filename=params["key_filename"], timeout=params["timeout"],
         allow_agent=params["allow_agent"],
         look_for_keys=params["look_for_keys"],
     )
@@ -405,7 +408,9 @@ def main():
     parser.add_argument("--port", default="22", metavar="PORT",
                         help="SSH port (default: 22)")
     parser.add_argument("--user", metavar="USERNAME",
-                        help="SSH username (prompts for password)")
+                        help="SSH username; prompts for password unless --key-file is set")
+    parser.add_argument("--key-file", metavar="FILE",
+                        help="SSH private key file for publickey authentication")
     parser.add_argument("--output", choices=["csv", "mysql"], default=OUTPUT_MODE,
                         help="Output destination (default: csv)")
     parser.add_argument("--device", default=DEVICE_NAME,
@@ -429,11 +434,16 @@ def main():
 
     username = args.user
     password = None
-    if username:
+    key_file = os.path.expanduser(args.key_file) if args.key_file else None
+    if username and not key_file:
         password = getpass.getpass(f"Password for {username}@{args.bigip}: ")
+    if key_file and not os.path.isfile(key_file):
+        print(f"ERROR: SSH key file not found: {key_file}", file=sys.stderr)
+        sys.exit(1)
 
     try:
-        ssh_connect(args.bigip, int(args.port), username=username, password=password,
+        ssh_connect(args.bigip, int(args.port), username=username,
+                    password=password, key_filename=key_file,
                     no_host_key_check=args.no_host_key_check)
     except Exception as e:
         print(f"ERROR: Cannot connect to {args.bigip}:{args.port} - {e}", file=sys.stderr)

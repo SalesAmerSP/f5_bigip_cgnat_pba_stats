@@ -15,6 +15,8 @@ Usage:
     pba-stats --all
     pba-stats --summary
     pba-stats --all --enhanced
+    pba-stats --summary --no-inbound   # instant: uses tmctl, skips lsndb list pba
+    pba-stats --all --no-inbound       # skips lsndb list inbound (~20-30 min at 25k subs)
 """
 
 import argparse
@@ -23,8 +25,30 @@ import json
 import re
 import subprocess
 import sys
+import threading
+import time
 from collections import defaultdict
 from datetime import datetime
+
+_timing = False
+
+
+class Timer:
+    """Timing context manager. Only prints when --timing is active."""
+    def __init__(self, description):
+        self.description = description
+        self.start_time = None
+
+    def __enter__(self):
+        if _timing:
+            self.start_time = time.time()
+            print("[%s] Starting: %s" % (datetime.now().strftime("%H:%M:%S.%f")[:-3], self.description), file=sys.stderr)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if _timing and self.start_time is not None:
+            duration = time.time() - self.start_time
+            print("[%s] Completed: %s (%.3fs)" % (datetime.now().strftime("%H:%M:%S.%f")[:-3], self.description, duration), file=sys.stderr)
 
 
 def run_cmd(cmd, timeout=30):
@@ -97,7 +121,7 @@ def get_pba_entries():
 
 
 def get_inbound_mappings():
-    raw = run_cmd("lsndb list inbound", timeout=60)
+    raw = run_cmd("lsndb list inbound", timeout=120)
     mappings = []
     for line in raw.strip().split("\n"):
         m = re.match(
@@ -119,6 +143,83 @@ def get_inbound_mappings():
                 "age": int(m.group(6)),
             })
     return mappings
+
+
+def get_tmctl_pool_stats():
+    """
+    Return per-pool block counts from tmctl (instant, no lsndb needed).
+    Uses fw_lsn_pool_pba_stat which reads directly from TMM shared memory.
+    Returns dict: pool_name -> {active_port_blocks, total_port_blocks}
+    Returns empty dict if tmctl is unavailable (older TMOS).
+    """
+    raw = run_cmd(
+        "tmctl -c -s name,active_port_blocks,total_port_blocks fw_lsn_pool_pba_stat 2>/dev/null"
+    )
+    stats = {}
+    for line in raw.strip().split("\n"):
+        line = line.strip()
+        if not line or line.startswith("name"):
+            continue
+        parts = line.split(",")
+        if len(parts) != 3:
+            continue
+        # Strip partition prefix (/Common/ etc.)
+        name = parts[0].rsplit("/", 1)[-1]
+        try:
+            stats[name] = {
+                "active_port_blocks": int(parts[1]),
+                "total_port_blocks": int(parts[2]),
+            }
+        except ValueError:
+            continue
+    return stats
+
+
+def get_pba_client_summary():
+    """
+    Return per-client block count from 'lsndb summary pba'.
+    Produces one output line per subscriber (vs one per block for lsndb list pba),
+    so it is faster on large deployments when per-pool IP breakdown is not needed.
+    Returns dict: client_ip -> block_count
+    """
+    raw = run_cmd("lsndb summary pba")
+    clients = {}
+    for line in raw.strip().split("\n"):
+        m = re.match(r"^(\d+\.\d+\.\d+\.\d+)\s+(\d+)\s*$", line)
+        if m:
+            clients[m.group(1)] = int(m.group(2))
+    return clients
+
+
+def _collect_parallel(want_inbound):
+    """
+    Collect pool configs, PBA entries, and optionally inbound mappings concurrently.
+    Returns (pools, pba_entries, mappings).
+    """
+    results = {"pools": {}, "pba": [], "mappings": []}
+
+    def _get_pools():
+        results["pools"] = get_pool_configs()
+
+    def _get_pba():
+        results["pba"] = get_pba_entries()
+
+    def _get_inbound():
+        results["mappings"] = get_inbound_mappings()
+
+    threads = [
+        threading.Thread(target=_get_pools),
+        threading.Thread(target=_get_pba),
+    ]
+    if want_inbound:
+        threads.append(threading.Thread(target=_get_inbound))
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    return results["pools"], results["pba"], results["mappings"]
 
 
 # ---------------------------------------------------------------------------
@@ -162,23 +263,47 @@ def find_pool_for_ip(external_ip, pools):
     return None, None
 
 
-def count_ports_used(client_ip, port_start, port_end, mappings):
-    ports = set()
+def build_mapping_indexes(mappings):
+    mapping_index = {}
+    client_mapping_index = defaultdict(list)
     for m in mappings:
-        if m["client_ip"] == client_ip and port_start <= m["translation_port"] <= port_end:
+        key = (m["client_ip"], m["translation_ip"])
+        mapping_index.setdefault(key, []).append(m)
+        client_mapping_index[m["client_ip"]].append(m)
+    return mapping_index, client_mapping_index
+
+
+def count_ports_used(client_ip, translation_ip, port_start, port_end, mapping_index):
+    """
+    Count unique ports used within a block. Returns None when mapping_index is None
+    (--no-inbound: inbound data was not collected).
+    """
+    if mapping_index is None:
+        return None
+    ports = set()
+    for m in mapping_index.get((client_ip, translation_ip), []):
+        if port_start <= m["translation_port"] <= port_end:
             ports.add(m["translation_port"])
     return len(ports)
 
 
-def count_ports_by_protocol(client_ip, port_start, port_end, mappings):
+def count_ports_by_protocol(client_ip, translation_ip, port_start, port_end, mapping_index):
+    if mapping_index is None:
+        return {}
     proto_counts = defaultdict(int)
-    for m in mappings:
-        if m["client_ip"] == client_ip and port_start <= m["translation_port"] <= port_end:
+    for m in mapping_index.get((client_ip, translation_ip), []):
+        if port_start <= m["translation_port"] <= port_end:
             proto_counts[m.get("protocol", "?")] += 1
     return dict(proto_counts)
 
 
 def determine_block_state(ports_used, ttl):
+    """
+    Determine block state.
+    ports_used=None means --no-inbound (no inbound data); TTL is used as the only signal.
+    """
+    if ports_used is None:
+        return "Alloc" if ttl > 0 else "Inactive"
     if ports_used > 0:
         return "Active"
     if ttl > 0:
@@ -240,66 +365,71 @@ def print_pool_header(pool_name, pool_cfg, used_blocks, total_blocks, per_host=F
     print(base_sub)
 
 
-def print_pba_rows(entries, mappings, block_size, enhanced=False):
+def print_pba_rows(entries, mapping_index, block_size, enhanced=False):
     entries.sort(key=lambda e: (e["external_ip"], e["port_start"]))
     for entry in entries:
         port_range = "%d-%d" % (entry["port_start"], entry["port_end"])
-        ports_used = count_ports_used(entry["client_ip"], entry["port_start"], entry["port_end"], mappings)
+        ports_used = count_ports_used(
+            entry["client_ip"], entry["external_ip"], entry["port_start"], entry["port_end"], mapping_index
+        )
         state = determine_block_state(ports_used, entry["ttl"])
         ttl_str = "-" if entry["ttl"] == 0 else str(entry["ttl"])
-        line = "%-30s%-31s%12s%12d/%d*1    %s/%s" % (
+        ports_str = "-" if ports_used is None else str(ports_used)
+        line = "%-30s%-31s%12s%12s/%d*1    %s/%s" % (
             entry["client_ip"], entry["external_ip"], port_range,
-            ports_used, block_size, state, ttl_str
+            ports_str, block_size, state, ttl_str
         )
         if enhanced:
-            util_pct = (ports_used / block_size * 100) if block_size > 0 else 0
             proto_counts = count_ports_by_protocol(
-                entry["client_ip"], entry["port_start"], entry["port_end"], mappings
+                entry["client_ip"], entry["external_ip"], entry["port_start"], entry["port_end"], mapping_index
             )
             if proto_counts:
                 proto_str = " ".join("%s:%d" % (proto, cnt) for proto, cnt in sorted(proto_counts.items()))
             else:
                 proto_str = "-"
             sub_id = entry.get("subscriber_id", "-")
-            line += "  %5.1f%%  %-16s  %s" % (util_pct, sub_id, proto_str)
+            if ports_used is None:
+                line += "  %6s  %-16s  %s" % ("-", sub_id, proto_str)
+            else:
+                util_pct = (ports_used / block_size * 100) if block_size > 0 else 0
+                line += "  %5.1f%%  %-16s  %s" % (util_pct, sub_id, proto_str)
         print(line)
 
 
-def print_enhanced_host_footer(host_ip, entries, mappings, pool_cfg):
+def print_enhanced_host_footer(host_ip, entries, client_mapping_index, pool_cfg):
     block_size = pool_cfg["block_size"]
     max_blocks = pool_cfg["client_block_limit"]
     num_blocks = len(entries)
+
     total_capacity = num_blocks * block_size
-
-    total_ports = 0
-    proto_totals = defaultdict(int)
-    for entry in entries:
-        for m in mappings:
-            if m["client_ip"] == host_ip and entry["port_start"] <= m["translation_port"] <= entry["port_end"]:
-                total_ports += 1
-                proto_totals[m.get("protocol", "?")] += 1
-
-    util_pct = (total_ports / total_capacity * 100) if total_capacity > 0 else 0
-    blocks_remaining = max(0, max_blocks - num_blocks)
-
     print()
     print("  --- Enhanced Host Summary for %s ---" % host_ip)
-    print("  Total ports in use:    %6d  /  %d capacity" % (total_ports, total_capacity))
-    print("  Overall utilization:   %5.1f%%" % util_pct)
+    if client_mapping_index is not None:
+        total_ports = 0
+        proto_totals = defaultdict(int)
+        for entry in entries:
+            for m in client_mapping_index.get(host_ip, []):
+                if entry["port_start"] <= m["translation_port"] <= entry["port_end"]:
+                    total_ports += 1
+                    proto_totals[m.get("protocol", "?")] += 1
+        util_pct = (total_ports / total_capacity * 100) if total_capacity > 0 else 0
+        print("  Total ports in use:    %6d  /  %d capacity" % (total_ports, total_capacity))
+        print("  Overall utilization:   %5.1f%%" % util_pct)
+    else:
+        print("  Port utilization:      (unavailable with --no-inbound)")
     print("  Blocks allocated:      %6d  /  %d max" % (num_blocks, max_blocks))
-    print("  Blocks remaining:      %6d" % blocks_remaining)
-    if proto_totals:
+    print("  Blocks remaining:      %6d" % max(0, max_blocks - num_blocks))
+    if client_mapping_index is not None and proto_totals:
         proto_str = "  ".join("%s: %d" % (proto, cnt) for proto, cnt in sorted(proto_totals.items()))
         print("  Protocol totals:       %s" % proto_str)
     ext_ips = sorted(set(e["external_ip"] for e in entries))
     print("  External IPs:          %s" % ", ".join(ext_ips))
 
 
-def print_enhanced_pool_footer(entries, mappings, pool_cfg, pool_name, total_blocks,
+def print_enhanced_pool_footer(entries, client_mapping_index, pool_cfg, pool_name, total_blocks,
                                top_n=10):
     block_size = pool_cfg["block_size"]
 
-    # Aggregate per-client stats
     client_stats = {}
     for entry in entries:
         cip = entry["client_ip"]
@@ -307,20 +437,15 @@ def print_enhanced_pool_footer(entries, mappings, pool_cfg, pool_name, total_blo
             client_stats[cip] = {"blocks": 0, "ports": 0, "external_ips": set()}
         client_stats[cip]["blocks"] += 1
         client_stats[cip]["external_ips"].add(entry["external_ip"])
-        for m in mappings:
-            if m["client_ip"] == cip and entry["port_start"] <= m["translation_port"] <= entry["port_end"]:
-                client_stats[cip]["ports"] += 1
+        if client_mapping_index is not None:
+            for m in client_mapping_index.get(cip, []):
+                if entry["port_start"] <= m["translation_port"] <= entry["port_end"]:
+                    client_stats[cip]["ports"] += 1
 
     unique_clients = len(client_stats)
     total_blocks_used = len(entries)
     avg_blocks = total_blocks_used / unique_clients if unique_clients > 0 else 0
-    total_ports = sum(s["ports"] for s in client_stats.values())
-    # Pool port capacity is the full pool (all available blocks * block_size),
-    # not just the blocks currently allocated. Previously this used
-    # total_blocks_used, which understated the denominator and made the
-    # utilization percentage look dramatically higher than reality.
     total_capacity = total_blocks * block_size
-    util_pct = (total_ports / total_capacity * 100) if total_capacity > 0 else 0
     pool_util_pct = (total_blocks_used / total_blocks * 100) if total_blocks > 0 else 0
 
     print()
@@ -328,32 +453,36 @@ def print_enhanced_pool_footer(entries, mappings, pool_cfg, pool_name, total_blo
     print("  Unique clients:        %6d" % unique_clients)
     print("  Total blocks used:     %6d  /  %d total  (%.1f%%)" % (
         total_blocks_used, total_blocks, pool_util_pct))
-    print("  Total ports in use:    %6d  /  %d capacity  (%.1f%%)" % (
-        total_ports, total_capacity, util_pct))
+    if client_mapping_index is not None:
+        total_ports = sum(s["ports"] for s in client_stats.values())
+        util_pct = (total_ports / total_capacity * 100) if total_capacity > 0 else 0
+        print("  Total ports in use:    %6d  /  %d capacity  (%.1f%%)" % (
+            total_ports, total_capacity, util_pct))
     print("  Avg blocks per client: %6.1f" % avg_blocks)
 
-    # Top N subscribers by port usage
-    top_by_ports = sorted(client_stats.items(), key=lambda x: x[1]["ports"], reverse=True)[:top_n]
-    print()
-    print("  Top %d subscribers by port usage:" % min(top_n, len(top_by_ports)))
-    print("    %-20s %8s %8s %8s  %s" % ("Client_IP", "Ports", "Blocks", "Util%", "External_IPs"))
-    for cip, stats in top_by_ports:
-        cap = stats["blocks"] * block_size
-        u = (stats["ports"] / cap * 100) if cap > 0 else 0
-        ext_str = ", ".join(sorted(stats["external_ips"]))
-        print("    %-20s %8d %8d %7.1f%%  %s" % (cip, stats["ports"], stats["blocks"], u, ext_str))
+    if client_mapping_index is not None:
+        top_by_ports = sorted(client_stats.items(), key=lambda x: x[1]["ports"], reverse=True)[:top_n]
+        print()
+        print("  Top %d subscribers by port usage:" % min(top_n, len(top_by_ports)))
+        print("    %-20s %8s %8s %8s  %s" % ("Client_IP", "Ports", "Blocks", "Util%", "External_IPs"))
+        for cip, stats in top_by_ports:
+            cap = stats["blocks"] * block_size
+            u = (stats["ports"] / cap * 100) if cap > 0 else 0
+            ext_str = ", ".join(sorted(stats["external_ips"]))
+            print("    %-20s %8d %8d %7.1f%%  %s" % (cip, stats["ports"], stats["blocks"], u, ext_str))
 
-    # Top N subscribers by block count
     top_by_blocks = sorted(client_stats.items(), key=lambda x: x[1]["blocks"], reverse=True)[:top_n]
     print()
     print("  Top %d subscribers by block count:" % min(top_n, len(top_by_blocks)))
     print("    %-20s %8s %8s %8s" % ("Client_IP", "Blocks", "Ports", "Util%"))
     for cip, stats in top_by_blocks:
         cap = stats["blocks"] * block_size
-        u = (stats["ports"] / cap * 100) if cap > 0 else 0
-        print("    %-20s %8d %8d %7.1f%%" % (cip, stats["blocks"], stats["ports"], u))
+        if client_mapping_index is not None:
+            u = (stats["ports"] / cap * 100) if cap > 0 else 0
+            print("    %-20s %8d %8d %7.1f%%" % (cip, stats["blocks"], stats["ports"], u))
+        else:
+            print("    %-20s %8d %8s %8s" % (cip, stats["blocks"], "-", "-"))
 
-    # External IP distribution
     ext_ip_counts = defaultdict(int)
     for entry in entries:
         ext_ip_counts[entry["external_ip"]] += 1
@@ -366,7 +495,7 @@ def print_enhanced_pool_footer(entries, mappings, pool_cfg, pool_name, total_blo
         print("    %-20s %8d %7.1f%%" % (eip, cnt, alloc_pct))
 
 
-def show_host(host_ip, pba_entries, mappings, pools, enhanced=False):
+def show_host(host_ip, pba_entries, mapping_index, client_mapping_index, pools, enhanced=False):
     host_entries = [e for e in pba_entries if e["client_ip"] == host_ip]
     if not host_entries:
         print("No port block allocations found for %s" % host_ip)
@@ -378,12 +507,12 @@ def show_host(host_ip, pba_entries, mappings, pools, enhanced=False):
     total_blocks = calc_total_port_blocks(pool_cfg)
     print_pool_header(pool_name, pool_cfg, len(host_entries), total_blocks, per_host=True,
                       enhanced=enhanced)
-    print_pba_rows(host_entries, mappings, pool_cfg["block_size"], enhanced=enhanced)
+    print_pba_rows(host_entries, mapping_index, pool_cfg["block_size"], enhanced=enhanced)
     if enhanced:
-        print_enhanced_host_footer(host_ip, host_entries, mappings, pool_cfg)
+        print_enhanced_host_footer(host_ip, host_entries, client_mapping_index, pool_cfg)
 
 
-def show_pool(pool_name, pba_entries, mappings, pools, enhanced=False):
+def show_pool(pool_name, pba_entries, mapping_index, client_mapping_index, pools, enhanced=False):
     pool_cfg = pools.get(pool_name)
     if not pool_cfg:
         print("Pool '%s' not found. Available pools:" % pool_name)
@@ -400,12 +529,12 @@ def show_pool(pool_name, pba_entries, mappings, pools, enhanced=False):
         return
     total_blocks = calc_total_port_blocks(pool_cfg)
     print_pool_header(pool_name, pool_cfg, len(pool_entries), total_blocks, enhanced=enhanced)
-    print_pba_rows(pool_entries, mappings, pool_cfg["block_size"], enhanced=enhanced)
+    print_pba_rows(pool_entries, mapping_index, pool_cfg["block_size"], enhanced=enhanced)
     if enhanced:
-        print_enhanced_pool_footer(pool_entries, mappings, pool_cfg, pool_name, total_blocks)
+        print_enhanced_pool_footer(pool_entries, client_mapping_index, pool_cfg, pool_name, total_blocks)
 
 
-def show_all(pba_entries, mappings, pools, enhanced=False):
+def show_all(pba_entries, mapping_index, client_mapping_index, pools, enhanced=False):
     pool_groups = defaultdict(list)
     for entry in pba_entries:
         found_pool, _ = find_pool_for_ip(entry["external_ip"], pools)
@@ -419,9 +548,9 @@ def show_all(pba_entries, mappings, pools, enhanced=False):
         pool_cfg = pools.get(pool_name) or unknown_pool_cfg(entries)
         total_blocks = calc_total_port_blocks(pool_cfg)
         print_pool_header(pool_name, pool_cfg, len(entries), total_blocks, enhanced=enhanced)
-        print_pba_rows(entries, mappings, pool_cfg["block_size"], enhanced=enhanced)
+        print_pba_rows(entries, mapping_index, pool_cfg["block_size"], enhanced=enhanced)
         if enhanced:
-            print_enhanced_pool_footer(entries, mappings, pool_cfg, pool_name, total_blocks)
+            print_enhanced_pool_footer(entries, client_mapping_index, pool_cfg, pool_name, total_blocks)
 
 
 def show_summary(pba_entries, pools, enhanced=False):
@@ -465,15 +594,63 @@ def show_summary(pba_entries, pools, enhanced=False):
                 pool_nm, num_clients, num_blocks, block_size, max_blk))
 
 
+def show_fast_summary(pools, tmctl_stats, client_summary, enhanced=False):
+    """
+    Summary using tmctl (instant). Per-pool client count is unavailable in this
+    path; total unique subscribers across all pools is shown at the bottom.
+    Only pools with at least one active block are displayed.
+    """
+    now = datetime.now()
+    print(now.strftime("%b %d %H:%M:%S"))
+    print()
+
+    if enhanced:
+        print("%-45s %8s %12s %11s %11s %9s %7s" % (
+            "Pool Name", "Clients", "Blocks Used", "Total Blks", "Block Size",
+            "Max Blks", "Pool%"))
+        print("-" * 107)
+    else:
+        print("%-45s %8s %12s %11s %11s" % (
+            "Pool Name", "Clients", "Blocks Used", "Block Size", "Max Blocks"))
+        print("-" * 90)
+
+    active_pools = {n: d for n, d in tmctl_stats.items() if d["active_port_blocks"] > 0}
+    for pool_name in sorted(active_pools.keys()):
+        ts = active_pools[pool_name]
+        pool_cfg = pools.get(pool_name, {})
+        blocks_used = ts["active_port_blocks"]
+        total_blocks = ts["total_port_blocks"]
+        block_size = pool_cfg.get("block_size", "?")
+        max_blk = pool_cfg.get("client_block_limit", "?")
+        if enhanced:
+            pool_pct = (blocks_used / total_blocks * 100) if total_blocks > 0 else 0
+            print("%-45s %8s %12d %11d %11s %9s %6.1f%%" % (
+                pool_name, "-", blocks_used, total_blocks, block_size, max_blk, pool_pct))
+        else:
+            print("%-45s %8s %12d %11s %11s" % (
+                pool_name, "-", blocks_used, block_size, max_blk))
+
+    if not active_pools:
+        print("(no active port blocks found)")
+
+    print()
+    print("Total unique subscribers (all pools): %d" % len(client_summary))
+    print("(Per-pool client count unavailable with --no-inbound; omit --no-inbound for full breakdown)")
+
+
 # ---------------------------------------------------------------------------
 # JSON output builders
 # ---------------------------------------------------------------------------
 
-def build_block_data(entry, mappings, block_size):
-    ports_used = count_ports_used(entry["client_ip"], entry["port_start"], entry["port_end"], mappings)
-    proto_counts = count_ports_by_protocol(entry["client_ip"], entry["port_start"], entry["port_end"], mappings)
+def build_block_data(entry, mapping_index, block_size):
+    ports_used = count_ports_used(
+        entry["client_ip"], entry["external_ip"], entry["port_start"], entry["port_end"], mapping_index
+    )
+    proto_counts = count_ports_by_protocol(
+        entry["client_ip"], entry["external_ip"], entry["port_start"], entry["port_end"], mapping_index
+    )
     state = determine_block_state(ports_used, entry["ttl"])
-    util_pct = (ports_used / block_size * 100) if block_size > 0 else 0
+    util_pct = (ports_used / block_size * 100) if (ports_used is not None and block_size > 0) else None
     return {
         "client_ip": entry["client_ip"],
         "external_ip": entry["external_ip"],
@@ -483,15 +660,16 @@ def build_block_data(entry, mappings, block_size):
         "ttl": entry["ttl"],
         "ports_used": ports_used,
         "ports_total": block_size,
-        "utilization_pct": round(util_pct, 1),
+        "utilization_pct": round(util_pct, 1) if util_pct is not None else None,
         "block_state": state,
         "protocol_breakdown": proto_counts,
     }
 
 
-def build_pool_data(pool_name, pool_cfg, entries, mappings, total_blocks):
+def build_pool_data(pool_name, pool_cfg, entries, mapping_index, total_blocks):
     block_size = pool_cfg["block_size"]
-    blocks = [build_block_data(e, mappings, block_size) for e in
+    has_inbound = mapping_index is not None
+    blocks = [build_block_data(e, mapping_index, block_size) for e in
               sorted(entries, key=lambda e: (e["external_ip"], e["port_start"]))]
 
     client_stats = {}
@@ -500,15 +678,14 @@ def build_pool_data(pool_name, pool_cfg, entries, mappings, total_blocks):
         if cip not in client_stats:
             client_stats[cip] = {"blocks": 0, "ports_used": 0, "external_ips": set()}
         client_stats[cip]["blocks"] += 1
-        client_stats[cip]["ports_used"] += block["ports_used"]
+        if block["ports_used"] is not None:
+            client_stats[cip]["ports_used"] += block["ports_used"]
         client_stats[cip]["external_ips"].add(block["external_ip"])
 
-    total_ports = sum(b["ports_used"] for b in blocks)
-    # Pool port capacity is the full pool (all available blocks * block_size),
-    # not just the blocks currently allocated.
+    total_ports = sum(b["ports_used"] for b in blocks if b["ports_used"] is not None)
     total_capacity = total_blocks * block_size
     pool_util_pct = (len(entries) / total_blocks * 100) if total_blocks > 0 else 0
-    port_util_pct = (total_ports / total_capacity * 100) if total_capacity > 0 else 0
+    port_util_pct = round((total_ports / total_capacity * 100), 1) if (total_capacity > 0 and has_inbound) else None
 
     ext_ip_dist = defaultdict(int)
     for e in entries:
@@ -521,8 +698,8 @@ def build_pool_data(pool_name, pool_cfg, entries, mappings, total_blocks):
         clients.append({
             "client_ip": cip,
             "blocks": stats["blocks"],
-            "ports_used": stats["ports_used"],
-            "utilization_pct": round((stats["ports_used"] / cap * 100) if cap > 0 else 0, 1),
+            "ports_used": stats["ports_used"] if has_inbound else None,
+            "utilization_pct": round((stats["ports_used"] / cap * 100) if cap > 0 else 0, 1) if has_inbound else None,
             "external_ips": sorted(stats["external_ips"]),
         })
 
@@ -533,9 +710,9 @@ def build_pool_data(pool_name, pool_cfg, entries, mappings, total_blocks):
         "blocks_used": len(entries),
         "blocks_total": total_blocks,
         "pool_utilization_pct": round(pool_util_pct, 1),
-        "total_ports_used": total_ports,
+        "total_ports_used": total_ports if has_inbound else None,
         "total_port_capacity": total_capacity,
-        "port_utilization_pct": round(port_util_pct, 1),
+        "port_utilization_pct": port_util_pct,
         "unique_clients": len(client_stats),
         "avg_blocks_per_client": round(len(entries) / len(client_stats), 1) if client_stats else 0,
         "blocks": blocks,
@@ -544,7 +721,7 @@ def build_pool_data(pool_name, pool_cfg, entries, mappings, total_blocks):
     }
 
 
-def json_host(host_ip, pba_entries, mappings, pools):
+def json_host(host_ip, pba_entries, mapping_index, pools):
     host_entries = [e for e in pba_entries if e["client_ip"] == host_ip]
     if not host_entries:
         return {"error": "No port block allocations found for %s" % host_ip}
@@ -554,13 +731,14 @@ def json_host(host_ip, pba_entries, mappings, pools):
         pool_cfg = unknown_pool_cfg(host_entries)
         pool_name = "Unknown"
 
+    has_inbound = mapping_index is not None
     block_size = pool_cfg["block_size"]
-    blocks = [build_block_data(e, mappings, block_size) for e in
+    blocks = [build_block_data(e, mapping_index, block_size) for e in
               sorted(host_entries, key=lambda e: (e["external_ip"], e["port_start"]))]
 
-    total_ports = sum(b["ports_used"] for b in blocks)
+    total_ports = sum(b["ports_used"] for b in blocks if b["ports_used"] is not None)
     total_capacity = len(host_entries) * block_size
-    util_pct = (total_ports / total_capacity * 100) if total_capacity > 0 else 0
+    util_pct = round((total_ports / total_capacity * 100), 1) if (total_capacity > 0 and has_inbound) else None
 
     proto_totals = defaultdict(int)
     for b in blocks:
@@ -575,16 +753,16 @@ def json_host(host_ip, pba_entries, mappings, pools):
         "client_block_limit": pool_cfg["client_block_limit"],
         "blocks_allocated": len(host_entries),
         "blocks_remaining": max(0, pool_cfg["client_block_limit"] - len(host_entries)),
-        "total_ports_used": total_ports,
+        "total_ports_used": total_ports if has_inbound else None,
         "total_port_capacity": total_capacity,
-        "utilization_pct": round(util_pct, 1),
+        "utilization_pct": util_pct,
         "protocol_totals": dict(proto_totals),
         "external_ips": sorted(set(e["external_ip"] for e in host_entries)),
         "blocks": blocks,
     }
 
 
-def json_pool(pool_name, pba_entries, mappings, pools):
+def json_pool(pool_name, pba_entries, mapping_index, pools):
     pool_cfg = pools.get(pool_name)
     if not pool_cfg:
         return {"error": "Pool '%s' not found" % pool_name, "available_pools": sorted(pools.keys())}
@@ -598,12 +776,12 @@ def json_pool(pool_name, pba_entries, mappings, pools):
         return {"error": "No port block allocations found for pool %s" % pool_name}
 
     total_blocks = calc_total_port_blocks(pool_cfg)
-    result = build_pool_data(pool_name, pool_cfg, pool_entries, mappings, total_blocks)
+    result = build_pool_data(pool_name, pool_cfg, pool_entries, mapping_index, total_blocks)
     result["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return result
 
 
-def json_xlated_ip(xlated_ip, pba_entries, mappings, pools):
+def json_xlated_ip(xlated_ip, pba_entries, mapping_index, pools):
     filtered = [e for e in pba_entries if e["external_ip"] == xlated_ip]
     if not filtered:
         return {"error": "No port block allocations found for translated IP %s" % xlated_ip}
@@ -614,13 +792,13 @@ def json_xlated_ip(xlated_ip, pba_entries, mappings, pools):
         pool_name = "Unknown"
 
     total_blocks = calc_total_port_blocks(pool_cfg)
-    result = build_pool_data(pool_name, pool_cfg, filtered, mappings, total_blocks)
+    result = build_pool_data(pool_name, pool_cfg, filtered, mapping_index, total_blocks)
     result["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     result["filtered_by"] = xlated_ip
     return result
 
 
-def json_all(pba_entries, mappings, pools):
+def json_all(pba_entries, mapping_index, pools):
     pool_groups = defaultdict(list)
     for entry in pba_entries:
         found_pool, _ = find_pool_for_ip(entry["external_ip"], pools)
@@ -631,7 +809,7 @@ def json_all(pba_entries, mappings, pools):
         entries = pool_groups[pool_name]
         pool_cfg = pools.get(pool_name) or unknown_pool_cfg(entries)
         total_blocks = calc_total_port_blocks(pool_cfg)
-        pool_data.append(build_pool_data(pool_name, pool_cfg, entries, mappings, total_blocks))
+        pool_data.append(build_pool_data(pool_name, pool_cfg, entries, mapping_index, total_blocks))
 
     return {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -675,6 +853,38 @@ def json_summary(pba_entries, pools):
     }
 
 
+def json_fast_summary(pools, tmctl_stats, client_summary):
+    """
+    JSON summary using tmctl data. Per-pool client breakdown is unavailable;
+    total unique subscribers is included at the top level.
+    Consumers should check fast_mode=true (set when --no-inbound is used) and handle clients=null.
+    """
+    pool_summaries = []
+    for pool_name in sorted(tmctl_stats.keys()):
+        ts = tmctl_stats[pool_name]
+        pool_cfg = pools.get(pool_name, {})
+        blocks_used = ts["active_port_blocks"]
+        total_blocks = ts["total_port_blocks"]
+        pool_pct = round((blocks_used / total_blocks * 100), 1) if total_blocks > 0 else 0
+        pool_summaries.append({
+            "pool_name": pool_name,
+            "clients": None,
+            "blocks_used": blocks_used,
+            "blocks_total": total_blocks,
+            "block_size": pool_cfg.get("block_size"),
+            "client_block_limit": pool_cfg.get("client_block_limit"),
+            "pool_utilization_pct": pool_pct,
+            "avg_blocks_per_client": None,
+        })
+
+    return {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "fast_mode": True,
+        "total_unique_subscribers": len(client_summary),
+        "pools": pool_summaries,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -692,60 +902,127 @@ def main():
                         help="Show enhanced stats (utilization %%, protocol breakdown, top subscribers, etc.)")
     parser.add_argument("--json", action="store_true",
                         help="Output data as JSON instead of text")
+    parser.add_argument("--no-inbound", action="store_true",
+                        help=(
+                            "Skip lsndb list inbound (omits port-in-use data). "
+                            "For --summary, uses tmctl instead of lsndb list pba entirely. "
+                            "Significantly faster on deployments with 10k+ subscribers."
+                        ))
+    parser.add_argument("--timing", action="store_true",
+                        help="Print timing diagnostics to stderr (start/stop timestamps and durations)")
 
     args = parser.parse_args()
 
-    pools = get_pool_configs()
-    pba_entries = get_pba_entries()
+    global _timing
+    _timing = args.timing
+    script_start = time.time()
+    if _timing:
+        print("[%s] Starting CGNAT PBA Stats script (lsndb)" % datetime.now().strftime("%H:%M:%S.%f")[:-3], file=sys.stderr)
+
+    enhanced = args.enhanced
+    use_json = args.json
+    fast_mode = args.no_inbound
+
+    # --summary --no-inbound: bypass lsndb entirely using tmctl + lsndb summary pba
+    if args.summary and fast_mode:
+        with Timer("Fetching pool configurations"):
+            pools = get_pool_configs()
+        with Timer("Fetching tmctl pool stats (fast path)"):
+            tmctl_stats = get_tmctl_pool_stats()
+        if not tmctl_stats:
+            # tmctl unavailable (older TMOS?) — fall back to normal summary path
+            with Timer("Fetching PBA entries (tmctl unavailable, falling back)"):
+                pba_entries = get_pba_entries()
+            if not pba_entries:
+                print("No PBA entries found.")
+                sys.exit(0)
+            if use_json:
+                print(json.dumps(json_summary(pba_entries, pools), separators=(",", ":")))
+            else:
+                show_summary(pba_entries, pools, enhanced=enhanced)
+            if _timing:
+                print("\n[%s] Script completed in %.3fs" % (datetime.now().strftime("%H:%M:%S.%f")[:-3], time.time() - script_start), file=sys.stderr)
+            return
+        with Timer("Fetching subscriber count summary"):
+            client_summary = get_pba_client_summary()
+        if use_json:
+            print(json.dumps(json_fast_summary(pools, tmctl_stats, client_summary), separators=(",", ":")))
+        else:
+            show_fast_summary(pools, tmctl_stats, client_summary, enhanced=enhanced)
+        if _timing:
+            print("\n[%s] Script completed in %.3fs" % (datetime.now().strftime("%H:%M:%S.%f")[:-3], time.time() - script_start), file=sys.stderr)
+        return
+
+    # --summary (normal): pba entries only, no inbound; run tmsh + lsndb concurrently
+    if args.summary:
+        with Timer("Fetching pool configs and PBA entries"):
+            pools, pba_entries, _ = _collect_parallel(want_inbound=False)
+        if not pba_entries:
+            print("No PBA entries found.")
+            sys.exit(0)
+        if use_json:
+            print(json.dumps(json_summary(pba_entries, pools), separators=(",", ":")))
+        else:
+            show_summary(pba_entries, pools, enhanced=enhanced)
+        if _timing:
+            print("\n[%s] Script completed in %.3fs" % (datetime.now().strftime("%H:%M:%S.%f")[:-3], time.time() - script_start), file=sys.stderr)
+        return
+
+    # All other modes: run tmsh + lsndb pba + (optionally) lsndb inbound concurrently
+    want_inbound = not fast_mode
+    with Timer("Fetching pool configs, PBA entries%s" % (" and inbound mappings" if want_inbound else "")):
+        pools, pba_entries, mappings = _collect_parallel(want_inbound=want_inbound)
 
     if not pba_entries:
         print("No PBA entries found.")
         sys.exit(0)
 
-    enhanced = args.enhanced
-    use_json = args.json
+    if fast_mode:
+        mapping_index = None
+        client_mapping_index = None
+        if not use_json:
+            print("[--no-inbound: port-in-use data omitted. Run without --no-inbound for full stats.]")
+            print()
+    else:
+        mapping_index, client_mapping_index = build_mapping_indexes(mappings)
 
     if use_json:
-        if args.summary:
-            result = json_summary(pba_entries, pools)
-        else:
-            mappings = get_inbound_mappings()
-            if args.pool:
-                result = json_pool(args.pool, pba_entries, mappings, pools)
-            elif args.xlated_ip:
-                result = json_xlated_ip(args.xlated_ip, pba_entries, mappings, pools)
-            elif args.all:
-                result = json_all(pba_entries, mappings, pools)
-            else:
-                result = json_host(args.host_ip, pba_entries, mappings, pools)
-        print(json.dumps(result, separators=(",", ":")))
-    elif args.summary:
-        show_summary(pba_entries, pools, enhanced=enhanced)
-    else:
-        mappings = get_inbound_mappings()
-
         if args.pool:
-            show_pool(args.pool, pba_entries, mappings, pools, enhanced=enhanced)
+            result = json_pool(args.pool, pba_entries, mapping_index, pools)
         elif args.xlated_ip:
-            filtered = [e for e in pba_entries if e["external_ip"] == args.xlated_ip]
-            if not filtered:
-                print("No port block allocations found for translated IP %s" % args.xlated_ip)
-            else:
-                pool_name, pool_cfg = find_pool_for_ip(args.xlated_ip, pools)
-                if not pool_cfg:
-                    pool_cfg = unknown_pool_cfg(filtered)
-                    pool_name = "Unknown"
-                total_blocks = calc_total_port_blocks(pool_cfg)
-                print_pool_header(pool_name, pool_cfg, len(filtered), total_blocks,
-                                  enhanced=enhanced)
-                print_pba_rows(filtered, mappings, pool_cfg["block_size"], enhanced=enhanced)
-                if enhanced:
-                    print_enhanced_pool_footer(filtered, mappings, pool_cfg, pool_name,
-                                              total_blocks)
+            result = json_xlated_ip(args.xlated_ip, pba_entries, mapping_index, pools)
         elif args.all:
-            show_all(pba_entries, mappings, pools, enhanced=enhanced)
+            result = json_all(pba_entries, mapping_index, pools)
         else:
-            show_host(args.host_ip, pba_entries, mappings, pools, enhanced=enhanced)
+            result = json_host(args.host_ip, pba_entries, mapping_index, pools)
+        if fast_mode:
+            result["fast_mode"] = True
+        print(json.dumps(result, separators=(",", ":")))
+    elif args.pool:
+        show_pool(args.pool, pba_entries, mapping_index, client_mapping_index, pools, enhanced=enhanced)
+    elif args.xlated_ip:
+        filtered = [e for e in pba_entries if e["external_ip"] == args.xlated_ip]
+        if not filtered:
+            print("No port block allocations found for translated IP %s" % args.xlated_ip)
+        else:
+            pool_name, pool_cfg = find_pool_for_ip(args.xlated_ip, pools)
+            if not pool_cfg:
+                pool_cfg = unknown_pool_cfg(filtered)
+                pool_name = "Unknown"
+            total_blocks = calc_total_port_blocks(pool_cfg)
+            print_pool_header(pool_name, pool_cfg, len(filtered), total_blocks,
+                              enhanced=enhanced)
+            print_pba_rows(filtered, mapping_index, pool_cfg["block_size"], enhanced=enhanced)
+            if enhanced:
+                print_enhanced_pool_footer(filtered, client_mapping_index, pool_cfg, pool_name,
+                                           total_blocks)
+    elif args.all:
+        show_all(pba_entries, mapping_index, client_mapping_index, pools, enhanced=enhanced)
+    else:
+        show_host(args.host_ip, pba_entries, mapping_index, client_mapping_index, pools, enhanced=enhanced)
+
+    if _timing:
+        print("\n[%s] Script completed in %.3fs" % (datetime.now().strftime("%H:%M:%S.%f")[:-3], time.time() - script_start), file=sys.stderr)
 
 
 if __name__ == "__main__":

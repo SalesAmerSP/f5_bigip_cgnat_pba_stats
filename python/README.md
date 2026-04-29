@@ -13,14 +13,15 @@ python cgnat_pba_stats.py --bigip 10.0.0.1 --pool POOL_NAME
 python cgnat_pba_stats.py --bigip 10.0.0.1 --xlated-ip 198.51.100.1
 python cgnat_pba_stats.py --bigip 10.0.0.1 --all
 python cgnat_pba_stats.py --bigip 10.0.0.1 --summary
-python cgnat_pba_stats.py --bigip 10.0.0.1 --user admin --all   # prompts for password
-python cgnat_pba_stats.py --bigip 10.0.0.1 --port 47001 --all   # custom SSH port
+python cgnat_pba_stats.py --bigip 10.0.0.1 --user admin --all   # prompts for password when key file is not provided
+python cgnat_pba_stats.py --bigip 10.0.0.1 --user admin --key-file ~/.ssh/id_rsa --all   # SSH key authentication
+python cgnat_pba_stats.py --bigip 10.0.0.1 --port 47001 --user admin --key-file ~/.ssh/id_rsa --all   # custom SSH port and key auth
 python cgnat_pba_stats.py --bigip 10.0.0.1 --all --no-host-key-check  # skip host key verification
 ```
 
 ### cgnat_pba_stats_bigip_compatible.py
 
-Same functionality as `cgnat_pba_stats.py` but designed to run directly on the BIG-IP. Calls `lsndb` and `tmsh` locally without SSH. Compatible with BIG-IP's Python 3.8.
+Same functionality as `cgnat_pba_stats.py` but designed to run directly on the BIG-IP. Calls `lsndb` and `tmsh` locally without SSH. Compatible with BIG-IP's Python 3.8 and uses only the standard library.
 
 ```bash
 pba-stats <host_ip>
@@ -66,6 +67,40 @@ echo 'export PATH=/shared/scripts:$PATH' > /etc/profile.d/pba-stats.sh
 
 </details>
 
+### cgnat_api_stats.py
+
+Alternative monitoring script that uses SSH/tmsh instead of lsndb commands. Provides aggregate statistics only — **does not provide per-subscriber details**.
+
+**⚠️ LIMITATION**: This script demonstrates API-based monitoring but currently shows mock data. The iControl REST API provides only aggregate PBA statistics and cannot replace lsndb for detailed subscriber analysis.
+
+```bash
+python cgnat_api_stats.py --bigip 10.0.0.1 --pool POOL_NAME
+python cgnat_api_stats.py --bigip 10.0.0.1 --user admin --key-file ~/.ssh/id_rsa --pool POOL_NAME
+```
+
+## Performance Comparison
+
+Lab test with a pool containing 11 active subscribers (times scale with subscriber count):
+
+| Script                        | Total Time   | Data Detail Level         | Use Case                           |
+|-------------------------------|--------------|---------------------------|------------------------------------|
+| `cgnat_pba_stats.py` (lsndb)  | ~11 seconds  | Per-subscriber details    | Troubleshooting, detailed analysis |
+| `cgnat_api_stats.py` (API)    | ~3 seconds   | Aggregate statistics only | Monitoring, alerting               |
+
+- **lsndb approach**: Provides complete subscriber data (client IPs, port ranges, TTLs, connection details). On large deployments (10k+ subscribers), use `--no-inbound` to reduce collection time significantly.
+- **API approach**: 3x faster but lacks per-subscriber detail required for troubleshooting.
+- **Recommendation**: Use the API script for high-level monitoring/alerting; use lsndb for detailed subscriber analysis.
+
+**Missing from the API script:**
+
+- Individual client IP mappings
+- Port block ranges (start-end)
+- Subscriber ID strings
+- TTL values for allocations
+- Individual connection mappings
+- Protocol breakdown per connection
+- Connection age information
+
 ### cgnat_pba_collect.py
 
 Data collector that aggregates per-subscriber PBA statistics and exports to CSV or MySQL. Designed for periodic collection (e.g., cron).
@@ -82,8 +117,18 @@ python cgnat_pba_collect.py --bigip 10.0.0.1 --output mysql \
     --db-host localhost --db-name cgnat \
     --db-user root --db-pass changeme
 
+# Override device name stored in the DB record (default: bigip01)
+python cgnat_pba_collect.py --bigip 10.0.0.1 --output mysql --device my-cgnat-01 \
+    --db-host localhost --db-name cgnat --db-user root --db-pass changeme
+
+# Override MySQL port or table name
+python cgnat_pba_collect.py --bigip 10.0.0.1 --output mysql \
+    --db-host localhost --db-port 3307 --db-name cgnat \
+    --db-table pba_stats_prod --db-user root --db-pass changeme
+
 # With SSH credentials
 python cgnat_pba_collect.py --bigip 10.0.0.1 --user admin --output csv
+python cgnat_pba_collect.py --bigip 10.0.0.1 --user admin --key-file ~/.ssh/id_rsa --output csv
 
 # Skip host key verification
 python cgnat_pba_collect.py --bigip 10.0.0.1 --output csv --no-host-key-check
@@ -129,6 +174,52 @@ Host_IP                       External_IP                    Port_Block  Ports_U
 - **Active** - Ports currently in use
 - **Query** - Block allocated but no active ports, TTL still running
 - **Inactive** - Block expired (TTL = 0, no ports in use)
+- **Alloc** - Fast-mode only: block allocated with TTL running, active/idle unknown (no inbound data)
+
+## `--no-inbound` mode (large deployments)
+
+On deployments with 10,000+ subscribers, `lsndb list inbound` can enumerate millions of active flow entries and take 20–30 minutes to complete. Add `--no-inbound` to skip this call:
+
+```bash
+# On-device (bigip_compatible) - skip inbound, show blocks without port counts
+pba-stats --all --no-inbound
+pba-stats --pool MyPool --no-inbound --json
+
+# --summary --no-inbound is even faster: uses tmctl (instant) + lsndb summary pba
+# instead of lsndb list pba entirely
+pba-stats --summary --no-inbound
+pba-stats --summary --no-inbound --json
+```
+
+```bash
+# Remote script
+python cgnat_pba_stats.py --bigip 10.0.0.1 --all --no-inbound
+python cgnat_pba_stats.py --bigip 10.0.0.1 --summary --no-inbound --json
+```
+
+### What `--no-inbound` changes
+
+| Feature | Normal | `--no-inbound` |
+| --- | --- | --- |
+| `lsndb list inbound` called | Yes | No |
+| `lsndb list pba` called | Yes | Yes (except `--summary --no-inbound`) |
+| `tmctl fw_lsn_pool_pba_stat` called | No | Yes (for `--summary` only) |
+| Ports_Used column | Actual count | `-` |
+| Block_State | Active / Query / Inactive | Alloc / Inactive (TTL-based) |
+| Protocol breakdown | Yes | No (shown as `-`) |
+| Per-pool client count | Yes | `-` (total shown at bottom) |
+
+### JSON schema with `--no-inbound`
+
+JSON output includes `"fast_mode": true` at the root when `--no-inbound` is used. Fields that require inbound data are set to `null`:
+
+- `ports_used: null` per block
+- `utilization_pct: null` per block and per client
+- `total_ports_used: null` per pool
+- `port_utilization_pct: null` per pool
+- `clients: null` per pool (summary mode)
+
+Consumers should check `fast_mode` and handle `null` accordingly.
 
 ## Enhanced Mode
 
@@ -188,6 +279,33 @@ JSON output is compact (not pretty-printed) for use in API calls and scripting. 
 - **Host mode**: `host_ip`, `pool_name`, `blocks_allocated`, `blocks_remaining`, `utilization_pct`, `protocol_totals`, `blocks[]`
 - **Pool / xlated-ip / all mode**: Per-pool objects with `blocks[]`, `clients[]`, `external_ip_distribution`
 - **Summary mode**: `pools[]` with `clients`, `blocks_used`, `blocks_total`, `pool_utilization_pct`, `avg_blocks_per_client`
+
+## Timing Diagnostics
+
+> Available in `cgnat_pba_stats.py` and `cgnat_pba_stats_bigip_compatible.py`.
+
+Add `--timing` to print per-phase start/stop timestamps and elapsed times to stderr:
+
+```bash
+python cgnat_pba_stats.py --bigip 10.0.0.1 --summary --timing
+pba-stats --all --no-inbound --timing
+```
+
+Sample stderr output:
+
+```text
+[14:02:31.443] Starting CGNAT PBA Stats script (lsndb)
+[14:02:31.443] Starting: SSH connection establishment
+[14:02:31.897] Completed: SSH connection establishment (0.454s)
+[14:02:31.897] Starting: Fetching pool configurations
+[14:02:32.014] Completed: Fetching pool configurations (0.117s)
+[14:02:32.014] Starting: Fetching PBA entries
+[14:02:34.291] Completed: Fetching PBA entries (2.277s)
+
+[14:02:34.292] Script completed in 2.849s
+```
+
+Timing output goes to stderr so it does not interfere with `--json` consumers or shell pipelines. Without `--timing`, no diagnostic output is produced.
 
 ## Requirements
 
