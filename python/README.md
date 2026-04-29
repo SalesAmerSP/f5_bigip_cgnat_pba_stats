@@ -167,7 +167,7 @@ Host_IP                       External_IP                    Port_Block  Ports_U
 - **Active** - Ports currently in use
 - **Query** - Block allocated but no active ports, TTL still running
 - **Inactive** - Block expired (TTL = 0, no ports in use)
-- **Alloc** - Fast-mode only: block allocated, active/inactive unknown (no inbound data)
+- **Alloc** - Fast-mode only: block allocated with TTL running, active/idle unknown (no inbound data)
 
 ## Fast Mode (large deployments)
 
@@ -198,7 +198,7 @@ python cgnat_pba_stats.py --bigip 10.0.0.1 --summary --fast --json
 | `lsndb list pba` called | Yes | Yes (except `--summary --fast`) |
 | `tmctl fw_lsn_pool_pba_stat` called | No | Yes (for `--summary` only) |
 | Ports_Used column | Actual count | `-` |
-| Block_State | Active / Query / Inactive | Alloc / Query (TTL-based) |
+| Block_State | Active / Query / Inactive | Alloc / Inactive (TTL-based) |
 | Protocol breakdown | Yes | No (shown as `-`) |
 | Per-pool client count | Yes | `-` (total shown at bottom) |
 

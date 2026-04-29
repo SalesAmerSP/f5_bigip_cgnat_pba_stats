@@ -282,7 +282,7 @@ def determine_block_state(ports_used, ttl):
     ports_used=None means fast mode (no inbound data); TTL is used as the only signal.
     """
     if ports_used is None:
-        return "Query" if ttl > 0 else "Alloc"
+        return "Alloc" if ttl > 0 else "Inactive"
     if ports_used > 0:
         return "Active"
     if ttl > 0:
@@ -359,7 +359,6 @@ def print_pba_rows(entries, mapping_index, block_size, enhanced=False):
             ports_str, block_size, state, ttl_str
         )
         if enhanced:
-            util_pct = (ports_used / block_size * 100) if (ports_used is not None and block_size > 0) else 0
             proto_counts = count_ports_by_protocol(
                 entry["client_ip"], entry["external_ip"], entry["port_start"], entry["port_end"], mapping_index
             )
@@ -371,6 +370,7 @@ def print_pba_rows(entries, mapping_index, block_size, enhanced=False):
             if ports_used is None:
                 line += "  %6s  %-16s  %s" % ("-", sub_id, proto_str)
             else:
+                util_pct = (ports_used / block_size * 100) if block_size > 0 else 0
                 line += "  %5.1f%%  %-16s  %s" % (util_pct, sub_id, proto_str)
         print(line)
 
@@ -380,32 +380,29 @@ def print_enhanced_host_footer(host_ip, entries, client_mapping_index, pool_cfg)
     max_blocks = pool_cfg["client_block_limit"]
     num_blocks = len(entries)
 
+    total_capacity = num_blocks * block_size
     print()
     print("  --- Enhanced Host Summary for %s ---" % host_ip)
+    if client_mapping_index is not None:
+        total_ports = 0
+        proto_totals = defaultdict(int)
+        for entry in entries:
+            for m in client_mapping_index.get(host_ip, []):
+                if entry["port_start"] <= m["translation_port"] <= entry["port_end"]:
+                    total_ports += 1
+                    proto_totals[m.get("protocol", "?")] += 1
+        util_pct = (total_ports / total_capacity * 100) if total_capacity > 0 else 0
+        print("  Total ports in use:    %6d  /  %d capacity" % (total_ports, total_capacity))
+        print("  Overall utilization:   %5.1f%%" % util_pct)
+    else:
+        print("  Port utilization:      (unavailable in fast mode)")
     print("  Blocks allocated:      %6d  /  %d max" % (num_blocks, max_blocks))
     print("  Blocks remaining:      %6d" % max(0, max_blocks - num_blocks))
-    ext_ips = sorted(set(e["external_ip"] for e in entries))
-    print("  External IPs:          %s" % ", ".join(ext_ips))
-
-    if client_mapping_index is None:
-        print("  Port utilization:      (unavailable in fast mode)")
-        return
-
-    total_capacity = num_blocks * block_size
-    total_ports = 0
-    proto_totals = defaultdict(int)
-    for entry in entries:
-        for m in client_mapping_index.get(host_ip, []):
-            if entry["port_start"] <= m["translation_port"] <= entry["port_end"]:
-                total_ports += 1
-                proto_totals[m.get("protocol", "?")] += 1
-
-    util_pct = (total_ports / total_capacity * 100) if total_capacity > 0 else 0
-    print("  Total ports in use:    %6d  /  %d capacity" % (total_ports, total_capacity))
-    print("  Overall utilization:   %5.1f%%" % util_pct)
-    if proto_totals:
+    if client_mapping_index is not None and proto_totals:
         proto_str = "  ".join("%s: %d" % (proto, cnt) for proto, cnt in sorted(proto_totals.items()))
         print("  Protocol totals:       %s" % proto_str)
+    ext_ips = sorted(set(e["external_ip"] for e in entries))
+    print("  External IPs:          %s" % ", ".join(ext_ips))
 
 
 def print_enhanced_pool_footer(entries, client_mapping_index, pool_cfg, pool_name, total_blocks,
@@ -839,7 +836,7 @@ def json_fast_summary(pools, tmctl_stats, client_summary):
     """
     JSON summary using tmctl data. Per-pool client breakdown is unavailable;
     total unique subscribers is included at the top level.
-    consumers should check fast_mode=true and handle clients=null.
+    Consumers should check fast_mode=true and handle clients=null.
     """
     pool_summaries = []
     for pool_name in sorted(tmctl_stats.keys()):
@@ -853,8 +850,8 @@ def json_fast_summary(pools, tmctl_stats, client_summary):
             "clients": None,
             "blocks_used": blocks_used,
             "blocks_total": total_blocks,
-            "block_size": pool_cfg.get("block_size", None),
-            "client_block_limit": pool_cfg.get("client_block_limit", None),
+            "block_size": pool_cfg.get("block_size"),
+            "client_block_limit": pool_cfg.get("client_block_limit"),
             "pool_utilization_pct": pool_pct,
             "avg_blocks_per_client": None,
         })

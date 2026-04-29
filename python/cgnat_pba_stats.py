@@ -349,7 +349,7 @@ def determine_block_state(ports_used: int | None, ttl: int, block_idle_timeout: 
     ports_used=None means fast mode (no inbound data); TTL is used as the only signal.
     """
     if ports_used is None:
-        return "Query" if ttl > 0 else "Alloc"
+        return "Alloc" if ttl > 0 else "Inactive"
     if ports_used > 0:
         return "Active"
     if ttl > 0:
@@ -443,7 +443,6 @@ def print_pba_rows(entries: list[dict], mapping_index,
             f"{'':>4}{state}/{ttl_str}"
         )
         if enhanced:
-            util_pct = (ports_used / block_size * 100) if (ports_used is not None and block_size > 0) else 0
             proto_counts = count_ports_by_protocol(
                 entry["client_ip"], entry["external_ip"], entry["port_start"], entry["port_end"], mapping_index
             )
@@ -452,6 +451,7 @@ def print_pba_rows(entries: list[dict], mapping_index,
             if ports_used is None:
                 line += f"  {'-':>6}  {sub_id:<16}  {proto_str}"
             else:
+                util_pct = (ports_used / block_size * 100) if block_size > 0 else 0
                 line += f"  {util_pct:>5.1f}%  {sub_id:<16}  {proto_str}"
         print(line)
 
@@ -463,32 +463,29 @@ def print_enhanced_host_footer(host_ip: str, entries: list[dict],
     max_blocks = pool_cfg["client_block_limit"]
     num_blocks = len(entries)
 
+    total_capacity = num_blocks * block_size
     print()
     print(f"  --- Enhanced Host Summary for {host_ip} ---")
+    if client_mapping_index is not None:
+        total_ports = 0
+        proto_totals: dict[str, int] = defaultdict(int)
+        for entry in entries:
+            for m in client_mapping_index.get(host_ip, []):
+                if entry["external_ip"] == m["translation_ip"] and entry["port_start"] <= m["translation_port"] <= entry["port_end"]:
+                    total_ports += 1
+                    proto_totals[m.get("protocol", "?")] += 1
+        util_pct = (total_ports / total_capacity * 100) if total_capacity > 0 else 0
+        print(f"  Total ports in use:    {total_ports:>6}  /  {total_capacity} capacity")
+        print(f"  Overall utilization:   {util_pct:>5.1f}%")
+    else:
+        print("  Port utilization:      (unavailable in fast mode)")
     print(f"  Blocks allocated:      {num_blocks:>6}  /  {max_blocks} max")
     print(f"  Blocks remaining:      {max(0, max_blocks - num_blocks):>6}")
-    ext_ips = sorted(set(e["external_ip"] for e in entries))
-    print(f"  External IPs:          {', '.join(ext_ips)}")
-
-    if client_mapping_index is None:
-        print("  Port utilization:      (unavailable in fast mode)")
-        return
-
-    total_capacity = num_blocks * block_size
-    total_ports = 0
-    proto_totals: dict[str, int] = defaultdict(int)
-    for entry in entries:
-        for m in client_mapping_index.get(host_ip, []):
-            if entry["external_ip"] == m["translation_ip"] and entry["port_start"] <= m["translation_port"] <= entry["port_end"]:
-                total_ports += 1
-                proto_totals[m.get("protocol", "?")] += 1
-
-    util_pct = (total_ports / total_capacity * 100) if total_capacity > 0 else 0
-    print(f"  Total ports in use:    {total_ports:>6}  /  {total_capacity} capacity")
-    print(f"  Overall utilization:   {util_pct:>5.1f}%")
-    if proto_totals:
+    if client_mapping_index is not None and proto_totals:
         proto_str = "  ".join(f"{proto}: {cnt}" for proto, cnt in sorted(proto_totals.items()))
         print(f"  Protocol totals:       {proto_str}")
+    ext_ips = sorted(set(e["external_ip"] for e in entries))
+    print(f"  External IPs:          {', '.join(ext_ips)}")
 
 
 def print_enhanced_pool_footer(entries: list[dict], client_mapping_index,
