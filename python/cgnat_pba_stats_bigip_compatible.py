@@ -193,10 +193,13 @@ def get_pba_client_summary():
 
 def _collect_parallel(want_inbound):
     """
-    Collect pool configs, PBA entries, and optionally inbound mappings concurrently.
+    Collect pool configs, PBA entries, and optionally inbound mappings.
+    tmsh and lsndb list pba run concurrently (different subsystems); lsndb list
+    inbound runs sequentially after to avoid two concurrent lsndb queries on lsnd,
+    which is the primary cause of CPU spikes on busy deployments.
     Returns (pools, pba_entries, mappings).
     """
-    results = {"pools": {}, "pba": [], "mappings": []}
+    results = {"pools": {}, "pba": []}
 
     def _get_pools():
         results["pools"] = get_pool_configs()
@@ -204,22 +207,17 @@ def _collect_parallel(want_inbound):
     def _get_pba():
         results["pba"] = get_pba_entries()
 
-    def _get_inbound():
-        results["mappings"] = get_inbound_mappings()
-
     threads = [
         threading.Thread(target=_get_pools),
         threading.Thread(target=_get_pba),
     ]
-    if want_inbound:
-        threads.append(threading.Thread(target=_get_inbound))
-
     for t in threads:
         t.start()
     for t in threads:
         t.join()
 
-    return results["pools"], results["pba"], results["mappings"]
+    mappings = get_inbound_mappings() if want_inbound else []
+    return results["pools"], results["pba"], mappings
 
 
 # ---------------------------------------------------------------------------
@@ -396,7 +394,7 @@ def print_pba_rows(entries, mapping_index, block_size, enhanced=False):
         print(line)
 
 
-def print_enhanced_host_footer(host_ip, entries, client_mapping_index, pool_cfg):
+def print_enhanced_host_footer(host_ip, entries, mapping_index, pool_cfg):
     block_size = pool_cfg["block_size"]
     max_blocks = pool_cfg["client_block_limit"]
     num_blocks = len(entries)
@@ -404,14 +402,16 @@ def print_enhanced_host_footer(host_ip, entries, client_mapping_index, pool_cfg)
     total_capacity = num_blocks * block_size
     print()
     print("  --- Enhanced Host Summary for %s ---" % host_ip)
-    if client_mapping_index is not None:
+    if mapping_index is not None:
         total_ports = 0
         proto_totals = defaultdict(int)
         for entry in entries:
-            for m in client_mapping_index.get(host_ip, []):
+            ports_seen = set()
+            for m in mapping_index.get((host_ip, entry["external_ip"]), []):
                 if entry["port_start"] <= m["translation_port"] <= entry["port_end"]:
-                    total_ports += 1
+                    ports_seen.add(m["translation_port"])
                     proto_totals[m.get("protocol", "?")] += 1
+            total_ports += len(ports_seen)
         util_pct = (total_ports / total_capacity * 100) if total_capacity > 0 else 0
         print("  Total ports in use:    %6d  /  %d capacity" % (total_ports, total_capacity))
         print("  Overall utilization:   %5.1f%%" % util_pct)
@@ -419,14 +419,14 @@ def print_enhanced_host_footer(host_ip, entries, client_mapping_index, pool_cfg)
         print("  Port utilization:      (unavailable with --no-inbound)")
     print("  Blocks allocated:      %6d  /  %d max" % (num_blocks, max_blocks))
     print("  Blocks remaining:      %6d" % max(0, max_blocks - num_blocks))
-    if client_mapping_index is not None and proto_totals:
+    if mapping_index is not None and proto_totals:
         proto_str = "  ".join("%s: %d" % (proto, cnt) for proto, cnt in sorted(proto_totals.items()))
         print("  Protocol totals:       %s" % proto_str)
     ext_ips = sorted(set(e["external_ip"] for e in entries))
     print("  External IPs:          %s" % ", ".join(ext_ips))
 
 
-def print_enhanced_pool_footer(entries, client_mapping_index, pool_cfg, pool_name, total_blocks,
+def print_enhanced_pool_footer(entries, mapping_index, pool_cfg, pool_name, total_blocks,
                                top_n=10):
     block_size = pool_cfg["block_size"]
 
@@ -437,10 +437,9 @@ def print_enhanced_pool_footer(entries, client_mapping_index, pool_cfg, pool_nam
             client_stats[cip] = {"blocks": 0, "ports": 0, "external_ips": set()}
         client_stats[cip]["blocks"] += 1
         client_stats[cip]["external_ips"].add(entry["external_ip"])
-        if client_mapping_index is not None:
-            for m in client_mapping_index.get(cip, []):
-                if entry["port_start"] <= m["translation_port"] <= entry["port_end"]:
-                    client_stats[cip]["ports"] += 1
+        if mapping_index is not None:
+            n = count_ports_used(cip, entry["external_ip"], entry["port_start"], entry["port_end"], mapping_index)
+            client_stats[cip]["ports"] += n
 
     unique_clients = len(client_stats)
     total_blocks_used = len(entries)
@@ -453,14 +452,14 @@ def print_enhanced_pool_footer(entries, client_mapping_index, pool_cfg, pool_nam
     print("  Unique clients:        %6d" % unique_clients)
     print("  Total blocks used:     %6d  /  %d total  (%.1f%%)" % (
         total_blocks_used, total_blocks, pool_util_pct))
-    if client_mapping_index is not None:
+    if mapping_index is not None:
         total_ports = sum(s["ports"] for s in client_stats.values())
         util_pct = (total_ports / total_capacity * 100) if total_capacity > 0 else 0
         print("  Total ports in use:    %6d  /  %d capacity  (%.1f%%)" % (
             total_ports, total_capacity, util_pct))
     print("  Avg blocks per client: %6.1f" % avg_blocks)
 
-    if client_mapping_index is not None:
+    if mapping_index is not None:
         top_by_ports = sorted(client_stats.items(), key=lambda x: x[1]["ports"], reverse=True)[:top_n]
         print()
         print("  Top %d subscribers by port usage:" % min(top_n, len(top_by_ports)))
@@ -477,7 +476,7 @@ def print_enhanced_pool_footer(entries, client_mapping_index, pool_cfg, pool_nam
     print("    %-20s %8s %8s %8s" % ("Client_IP", "Blocks", "Ports", "Util%"))
     for cip, stats in top_by_blocks:
         cap = stats["blocks"] * block_size
-        if client_mapping_index is not None:
+        if mapping_index is not None:
             u = (stats["ports"] / cap * 100) if cap > 0 else 0
             print("    %-20s %8d %8d %7.1f%%" % (cip, stats["blocks"], stats["ports"], u))
         else:
@@ -509,7 +508,7 @@ def show_host(host_ip, pba_entries, mapping_index, client_mapping_index, pools, 
                       enhanced=enhanced)
     print_pba_rows(host_entries, mapping_index, pool_cfg["block_size"], enhanced=enhanced)
     if enhanced:
-        print_enhanced_host_footer(host_ip, host_entries, client_mapping_index, pool_cfg)
+        print_enhanced_host_footer(host_ip, host_entries, mapping_index, pool_cfg)
 
 
 def show_pool(pool_name, pba_entries, mapping_index, client_mapping_index, pools, enhanced=False):
@@ -531,7 +530,7 @@ def show_pool(pool_name, pba_entries, mapping_index, client_mapping_index, pools
     print_pool_header(pool_name, pool_cfg, len(pool_entries), total_blocks, enhanced=enhanced)
     print_pba_rows(pool_entries, mapping_index, pool_cfg["block_size"], enhanced=enhanced)
     if enhanced:
-        print_enhanced_pool_footer(pool_entries, client_mapping_index, pool_cfg, pool_name, total_blocks)
+        print_enhanced_pool_footer(pool_entries, mapping_index, pool_cfg, pool_name, total_blocks)
 
 
 def show_all(pba_entries, mapping_index, client_mapping_index, pools, enhanced=False):
@@ -550,7 +549,7 @@ def show_all(pba_entries, mapping_index, client_mapping_index, pools, enhanced=F
         print_pool_header(pool_name, pool_cfg, len(entries), total_blocks, enhanced=enhanced)
         print_pba_rows(entries, mapping_index, pool_cfg["block_size"], enhanced=enhanced)
         if enhanced:
-            print_enhanced_pool_footer(entries, client_mapping_index, pool_cfg, pool_name, total_blocks)
+            print_enhanced_pool_footer(entries, mapping_index, pool_cfg, pool_name, total_blocks)
 
 
 def show_summary(pba_entries, pools, enhanced=False):
@@ -1014,7 +1013,7 @@ def main():
                               enhanced=enhanced)
             print_pba_rows(filtered, mapping_index, pool_cfg["block_size"], enhanced=enhanced)
             if enhanced:
-                print_enhanced_pool_footer(filtered, client_mapping_index, pool_cfg, pool_name,
+                print_enhanced_pool_footer(filtered, mapping_index, pool_cfg, pool_name,
                                            total_blocks)
     elif args.all:
         show_all(pba_entries, mapping_index, client_mapping_index, pools, enhanced=enhanced)
