@@ -87,7 +87,7 @@ Lab test with a pool containing 11 active subscribers (times scale with subscrib
 | `cgnat_pba_stats.py` (lsndb)  | ~11 seconds  | Per-subscriber details    | Troubleshooting, detailed analysis |
 | `cgnat_api_stats.py` (API)    | ~3 seconds   | Aggregate statistics only | Monitoring, alerting               |
 
-- **lsndb approach**: Provides complete subscriber data (client IPs, port ranges, TTLs, connection details). On large deployments (10k+ subscribers), use `--fast` to reduce collection time significantly.
+- **lsndb approach**: Provides complete subscriber data (client IPs, port ranges, TTLs, connection details). On large deployments (10k+ subscribers), use `--no-inbound` to reduce collection time significantly.
 - **API approach**: 3x faster but lacks per-subscriber detail required for troubleshooting.
 - **Recommendation**: Use the API script for high-level monitoring/alerting; use lsndb for detailed subscriber analysis.
 
@@ -176,48 +176,48 @@ Host_IP                       External_IP                    Port_Block  Ports_U
 - **Inactive** - Block expired (TTL = 0, no ports in use)
 - **Alloc** - Fast-mode only: block allocated with TTL running, active/idle unknown (no inbound data)
 
-## Fast Mode (large deployments)
+## `--no-inbound` mode (large deployments)
 
-On deployments with 10,000+ subscribers, `lsndb list inbound` can enumerate millions of active flow entries and take 20–30 minutes to complete. Add `--fast` to skip this call:
+On deployments with 10,000+ subscribers, `lsndb list inbound` can enumerate millions of active flow entries and take 20–30 minutes to complete. Add `--no-inbound` to skip this call:
 
 ```bash
 # On-device (bigip_compatible) - skip inbound, show blocks without port counts
-pba-stats --all --fast
-pba-stats --pool MyPool --fast --json
+pba-stats --all --no-inbound
+pba-stats --pool MyPool --no-inbound --json
 
-# --summary --fast is even faster: uses tmctl (instant) + lsndb summary pba
+# --summary --no-inbound is even faster: uses tmctl (instant) + lsndb summary pba
 # instead of lsndb list pba entirely
-pba-stats --summary --fast
-pba-stats --summary --fast --json
+pba-stats --summary --no-inbound
+pba-stats --summary --no-inbound --json
 ```
 
 ```bash
 # Remote script
-python cgnat_pba_stats.py --bigip 10.0.0.1 --all --fast
-python cgnat_pba_stats.py --bigip 10.0.0.1 --summary --fast --json
+python cgnat_pba_stats.py --bigip 10.0.0.1 --all --no-inbound
+python cgnat_pba_stats.py --bigip 10.0.0.1 --summary --no-inbound --json
 ```
 
-### What `--fast` changes
+### What `--no-inbound` changes
 
-| Feature | Normal | `--fast` |
+| Feature | Normal | `--no-inbound` |
 | --- | --- | --- |
 | `lsndb list inbound` called | Yes | No |
-| `lsndb list pba` called | Yes | Yes (except `--summary --fast`) |
+| `lsndb list pba` called | Yes | Yes (except `--summary --no-inbound`) |
 | `tmctl fw_lsn_pool_pba_stat` called | No | Yes (for `--summary` only) |
 | Ports_Used column | Actual count | `-` |
 | Block_State | Active / Query / Inactive | Alloc / Inactive (TTL-based) |
 | Protocol breakdown | Yes | No (shown as `-`) |
 | Per-pool client count | Yes | `-` (total shown at bottom) |
 
-### JSON schema in fast mode
+### JSON schema with `--no-inbound`
 
-Fast-mode JSON includes `"fast_mode": true` at the root. Fields that require inbound data are set to `null`:
+JSON output includes `"fast_mode": true` at the root when `--no-inbound` is used. Fields that require inbound data are set to `null`:
 
 - `ports_used: null` per block
 - `utilization_pct: null` per block and per client
 - `total_ports_used: null` per pool
 - `port_utilization_pct: null` per pool
-- `clients: null` per pool (summary fast mode)
+- `clients: null` per pool (summary mode)
 
 Consumers should check `fast_mode` and handle `null` accordingly.
 
@@ -288,7 +288,7 @@ Add `--timing` to print per-phase start/stop timestamps and elapsed times to std
 
 ```bash
 python cgnat_pba_stats.py --bigip 10.0.0.1 --summary --timing
-pba-stats --all --fast --timing
+pba-stats --all --no-inbound --timing
 ```
 
 Sample stderr output:

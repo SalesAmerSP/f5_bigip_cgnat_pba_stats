@@ -15,8 +15,8 @@ Usage:
     pba-stats --all
     pba-stats --summary
     pba-stats --all --enhanced
-    pba-stats --summary --fast   # instant: uses tmctl, skips lsndb list pba
-    pba-stats --all --fast       # skips lsndb list inbound (~20-30 min at 25k subs)
+    pba-stats --summary --no-inbound   # instant: uses tmctl, skips lsndb list pba
+    pba-stats --all --no-inbound       # skips lsndb list inbound (~20-30 min at 25k subs)
 """
 
 import argparse
@@ -276,7 +276,7 @@ def build_mapping_indexes(mappings):
 def count_ports_used(client_ip, translation_ip, port_start, port_end, mapping_index):
     """
     Count unique ports used within a block. Returns None when mapping_index is None
-    (fast mode — inbound data was not collected).
+    (--no-inbound: inbound data was not collected).
     """
     if mapping_index is None:
         return None
@@ -300,7 +300,7 @@ def count_ports_by_protocol(client_ip, translation_ip, port_start, port_end, map
 def determine_block_state(ports_used, ttl):
     """
     Determine block state.
-    ports_used=None means fast mode (no inbound data); TTL is used as the only signal.
+    ports_used=None means --no-inbound (no inbound data); TTL is used as the only signal.
     """
     if ports_used is None:
         return "Alloc" if ttl > 0 else "Inactive"
@@ -416,7 +416,7 @@ def print_enhanced_host_footer(host_ip, entries, client_mapping_index, pool_cfg)
         print("  Total ports in use:    %6d  /  %d capacity" % (total_ports, total_capacity))
         print("  Overall utilization:   %5.1f%%" % util_pct)
     else:
-        print("  Port utilization:      (unavailable in fast mode)")
+        print("  Port utilization:      (unavailable with --no-inbound)")
     print("  Blocks allocated:      %6d  /  %d max" % (num_blocks, max_blocks))
     print("  Blocks remaining:      %6d" % max(0, max_blocks - num_blocks))
     if client_mapping_index is not None and proto_totals:
@@ -635,7 +635,7 @@ def show_fast_summary(pools, tmctl_stats, client_summary, enhanced=False):
 
     print()
     print("Total unique subscribers (all pools): %d" % len(client_summary))
-    print("(Per-pool client count unavailable in fast mode; omit --fast for full breakdown)")
+    print("(Per-pool client count unavailable with --no-inbound; omit --no-inbound for full breakdown)")
 
 
 # ---------------------------------------------------------------------------
@@ -857,7 +857,7 @@ def json_fast_summary(pools, tmctl_stats, client_summary):
     """
     JSON summary using tmctl data. Per-pool client breakdown is unavailable;
     total unique subscribers is included at the top level.
-    Consumers should check fast_mode=true and handle clients=null.
+    Consumers should check fast_mode=true (set when --no-inbound is used) and handle clients=null.
     """
     pool_summaries = []
     for pool_name in sorted(tmctl_stats.keys()):
@@ -902,11 +902,11 @@ def main():
                         help="Show enhanced stats (utilization %%, protocol breakdown, top subscribers, etc.)")
     parser.add_argument("--json", action="store_true",
                         help="Output data as JSON instead of text")
-    parser.add_argument("--fast", action="store_true",
+    parser.add_argument("--no-inbound", action="store_true",
                         help=(
-                            "Fast mode: skip lsndb list inbound (port-in-use data omitted). "
+                            "Skip lsndb list inbound (omits port-in-use data). "
                             "For --summary, uses tmctl instead of lsndb list pba entirely. "
-                            "Dramatically faster on deployments with 10k+ subscribers."
+                            "Significantly faster on deployments with 10k+ subscribers."
                         ))
     parser.add_argument("--timing", action="store_true",
                         help="Print timing diagnostics to stderr (start/stop timestamps and durations)")
@@ -921,9 +921,9 @@ def main():
 
     enhanced = args.enhanced
     use_json = args.json
-    fast_mode = args.fast
+    fast_mode = args.no_inbound
 
-    # --summary --fast: bypass lsndb entirely using tmctl + lsndb summary pba
+    # --summary --no-inbound: bypass lsndb entirely using tmctl + lsndb summary pba
     if args.summary and fast_mode:
         with Timer("Fetching pool configurations"):
             pools = get_pool_configs()
@@ -981,7 +981,7 @@ def main():
         mapping_index = None
         client_mapping_index = None
         if not use_json:
-            print("[Fast mode: port-in-use data omitted. Run without --fast for full stats.]")
+            print("[--no-inbound: port-in-use data omitted. Run without --no-inbound for full stats.]")
             print()
     else:
         mapping_index, client_mapping_index = build_mapping_indexes(mappings)

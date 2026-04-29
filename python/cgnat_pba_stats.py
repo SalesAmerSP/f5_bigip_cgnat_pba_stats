@@ -323,7 +323,7 @@ def count_ports_used(client_ip: str, translation_ip: str, port_start: int,
                      port_end: int, mapping_index) -> int | None:
     """
     Count unique ports used within a port block for a client.
-    Returns None when mapping_index is None (fast mode — inbound data not collected).
+    Returns None when mapping_index is None (--no-inbound: inbound data not collected).
     """
     if mapping_index is None:
         return None
@@ -349,7 +349,7 @@ def count_ports_by_protocol(client_ip: str, translation_ip: str, port_start: int
 def determine_block_state(ports_used: int | None, ttl: int, block_idle_timeout: int = 0) -> str:
     """
     Determine block state.
-    ports_used=None means fast mode (no inbound data); TTL is used as the only signal.
+    ports_used=None means --no-inbound (no inbound data); TTL is used as the only signal.
     """
     if ports_used is None:
         return "Alloc" if ttl > 0 else "Inactive"
@@ -481,7 +481,7 @@ def print_enhanced_host_footer(host_ip: str, entries: list[dict],
         print(f"  Total ports in use:    {total_ports:>6}  /  {total_capacity} capacity")
         print(f"  Overall utilization:   {util_pct:>5.1f}%")
     else:
-        print("  Port utilization:      (unavailable in fast mode)")
+        print("  Port utilization:      (unavailable with --no-inbound)")
     print(f"  Blocks allocated:      {num_blocks:>6}  /  {max_blocks} max")
     print(f"  Blocks remaining:      {max(0, max_blocks - num_blocks):>6}")
     if client_mapping_index is not None and proto_totals:
@@ -895,14 +895,14 @@ def show_fast_summary(pools: dict, tmctl_stats: dict, client_summary: dict, enha
 
     print()
     print(f"Total unique subscribers (all pools): {len(client_summary)}")
-    print("(Per-pool client count unavailable in fast mode; omit --fast for full breakdown)")
+    print("(Per-pool client count unavailable with --no-inbound; omit --no-inbound for full breakdown)")
 
 
 def json_fast_summary(pools: dict, tmctl_stats: dict, client_summary: dict) -> dict:
     """
     JSON summary using tmctl data. Per-pool client breakdown is unavailable;
     total unique subscribers is included at the top level.
-    Consumers should check fast_mode=true and handle clients=null.
+    Consumers should check fast_mode=true (set when --no-inbound is used) and handle clients=null.
     """
     pool_summaries = []
     for pool_name in sorted(tmctl_stats.keys()):
@@ -993,11 +993,11 @@ def main():
                         help="Output data as JSON instead of text")
     parser.add_argument("--no-host-key-check", action="store_true",
                         help="Disable SSH host key verification (insecure)")
-    parser.add_argument("--fast", action="store_true",
+    parser.add_argument("--no-inbound", action="store_true",
                         help=(
-                            "Fast mode: skip lsndb list inbound (port-in-use data omitted). "
+                            "Skip lsndb list inbound (omits port-in-use data). "
                             "For --summary, uses tmctl instead of lsndb list pba entirely. "
-                            "Dramatically faster on deployments with 10k+ subscribers."
+                            "Significantly faster on deployments with 10k+ subscribers."
                         ))
     parser.add_argument("--timing", action="store_true",
                         help="Print timing diagnostics to stderr (start/stop timestamps and durations)")
@@ -1030,9 +1030,9 @@ def main():
 
     enhanced = args.enhanced
     use_json = args.json
-    fast_mode = args.fast
+    fast_mode = args.no_inbound
 
-    # --summary --fast: bypass lsndb entirely using tmctl + lsndb summary pba
+    # --summary --no-inbound: bypass lsndb entirely using tmctl + lsndb summary pba
     if args.summary and fast_mode:
         with Timer("Fetching pool configurations"):
             pools = get_pool_configs()
@@ -1093,7 +1093,7 @@ def main():
         mapping_index = None
         client_mapping_index = None
         if not use_json:
-            print("[Fast mode: port-in-use data omitted. Run without --fast for full stats.]")
+            print("[--no-inbound: port-in-use data omitted. Run without --no-inbound for full stats.]")
             print()
     else:
         with Timer("Fetching inbound mappings (port usage)"):
