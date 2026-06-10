@@ -59,6 +59,33 @@ def run_cmd(cmd, timeout=30):
     return result.stdout + result.stderr
 
 
+def stream_cmd(cmd, timeout=3600):
+    """
+    Run a local command and yield stdout lines one at a time.
+
+    lsndb dumps can reach several GB on busy CGNAT boxes while the BIG-IP
+    control plane has only a few GB of host RAM (most is hugepage-reserved
+    for TMM), so the output must never be buffered whole. stderr is merged
+    into the stream to match run_cmd behavior.
+    """
+    proc = subprocess.Popen(
+        cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True,
+    )
+    deadline = time.time() + timeout
+    try:
+        if proc.stdout is not None:
+            for line in proc.stdout:
+                yield line
+                if time.time() > deadline:
+                    proc.kill()
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+    finally:
+        if proc.stdout is not None:
+            proc.stdout.close()
+        proc.wait()
+
+
 # ---------------------------------------------------------------------------
 # Data collection (local - no SSH)
 # ---------------------------------------------------------------------------
@@ -97,17 +124,16 @@ def get_pool_configs():
 
 
 def get_pba_entries():
-    raw = run_cmd("lsndb list pba")
+    pattern = re.compile(
+        r"(\d+\.\d+\.\d+\.\d+)\s+"
+        r"(\d+\.\d+\.\d+\.\d+):(\d+)\s+-\s+(\d+)\s+"
+        r"(?:\(\S+\)\s+)?"
+        r"(\S+)\s+"
+        r"(\d+)"
+    )
     entries = []
-    for line in raw.strip().split("\n"):
-        m = re.match(
-            r"(\d+\.\d+\.\d+\.\d+)\s+"
-            r"(\d+\.\d+\.\d+\.\d+):(\d+)\s+-\s+(\d+)\s+"
-            r"(?:\(\S+\)\s+)?"
-            r"(\S+)\s+"
-            r"(\d+)",
-            line,
-        )
+    for line in stream_cmd("lsndb list pba"):
+        m = pattern.match(line)
         if m:
             entries.append({
                 "client_ip": m.group(1),
@@ -120,29 +146,56 @@ def get_pba_entries():
     return entries
 
 
-def get_inbound_mappings():
-    raw = run_cmd("lsndb list inbound", timeout=120)
-    mappings = []
-    for line in raw.strip().split("\n"):
-        m = re.match(
-            r"(\d+\.\d+\.\d+\.\d+):(\d+)\s+"
-            r"(\d+\.\d+\.\d+\.\d+):(\d+)\s+"
-            r"\S+\s+"
-            r"(?:\s+)?"
-            r"(\S+)\s+"
-            r"(\d+)",
-            line,
+def get_inbound_index(pba_entries):
+    """
+    Stream 'lsndb list inbound' and aggregate flows per allocated block:
+        (client_ip, external_ip, port_start, port_end) ->
+            {"ports": <bitmap of used ports>, "protos": {protocol: flow_count}}
+
+    The inbound dump has one line per active flow (millions on a busy box) and
+    the BIG-IP control plane has only a few GB of host RAM, so flows must be
+    folded into per-block counters as they stream by — materializing a dict
+    per flow drove the script to ~4 GB RSS and got it OOM-killed. Every
+    consumer queries by an exact PBA block, so the index is keyed that way
+    and memory is bounded by allocated blocks, not active flows.
+    """
+    blocks_by_key = {}
+    index = {}
+    for e in pba_entries:
+        stat = {"ports": 0, "protos": {}}
+        index[(e["client_ip"], e["external_ip"], e["port_start"], e["port_end"])] = stat
+        blocks_by_key.setdefault((e["client_ip"], e["external_ip"]), []).append(
+            (e["port_start"], e["port_end"], stat)
         )
-        if m:
-            mappings.append({
-                "translation_ip": m.group(1),
-                "translation_port": int(m.group(2)),
-                "client_ip": m.group(3),
-                "client_port": int(m.group(4)),
-                "protocol": m.group(5),
-                "age": int(m.group(6)),
-            })
-    return mappings
+    pattern = re.compile(
+        r"(\d+\.\d+\.\d+\.\d+):(\d+)\s+"
+        r"(\d+\.\d+\.\d+\.\d+):(\d+)\s+"
+        r"\S+\s+"
+        r"(?:\s+)?"
+        r"(\S+)\s+"
+        r"(\d+)"
+    )
+    for line in stream_cmd("lsndb list inbound"):
+        m = pattern.match(line)
+        if not m:
+            continue
+        blocks = blocks_by_key.get((m.group(3), m.group(1)))
+        if not blocks:
+            continue
+        port = int(m.group(2))
+        for start, end, stat in blocks:
+            if start <= port <= end:
+                stat["ports"] |= 1 << (port - start)
+                protos = stat["protos"]
+                protocol = m.group(5)
+                protos[protocol] = protos.get(protocol, 0) + 1
+                break
+    return index
+
+
+def _popcount(n):
+    """Count set bits. int.bit_count() needs 3.10; BIG-IP ships Python 3.8."""
+    return bin(n).count("1")
 
 
 def get_tmctl_pool_stats():
@@ -193,11 +246,12 @@ def get_pba_client_summary():
 
 def _collect_parallel(want_inbound):
     """
-    Collect pool configs, PBA entries, and optionally inbound mappings.
+    Collect pool configs, PBA entries, and optionally the inbound index.
     tmsh and lsndb list pba run concurrently (different subsystems); lsndb list
     inbound runs sequentially after to avoid two concurrent lsndb queries on lsnd,
     which is the primary cause of CPU spikes on busy deployments.
-    Returns (pools, pba_entries, mappings).
+    Returns (pools, pba_entries, mapping_index); mapping_index is None when
+    want_inbound is False.
     """
     results = {"pools": {}, "pba": []}
 
@@ -216,8 +270,8 @@ def _collect_parallel(want_inbound):
     for t in threads:
         t.join()
 
-    mappings = get_inbound_mappings() if want_inbound else []
-    return results["pools"], results["pba"], mappings
+    mapping_index = get_inbound_index(results["pba"]) if want_inbound else None
+    return results["pools"], results["pba"], mapping_index
 
 
 # ---------------------------------------------------------------------------
@@ -261,16 +315,6 @@ def find_pool_for_ip(external_ip, pools):
     return None, None
 
 
-def build_mapping_indexes(mappings):
-    mapping_index = {}
-    client_mapping_index = defaultdict(list)
-    for m in mappings:
-        key = (m["client_ip"], m["translation_ip"])
-        mapping_index.setdefault(key, []).append(m)
-        client_mapping_index[m["client_ip"]].append(m)
-    return mapping_index, client_mapping_index
-
-
 def count_ports_used(client_ip, translation_ip, port_start, port_end, mapping_index):
     """
     Count unique ports used within a block. Returns None when mapping_index is None
@@ -278,21 +322,15 @@ def count_ports_used(client_ip, translation_ip, port_start, port_end, mapping_in
     """
     if mapping_index is None:
         return None
-    ports = set()
-    for m in mapping_index.get((client_ip, translation_ip), []):
-        if port_start <= m["translation_port"] <= port_end:
-            ports.add(m["translation_port"])
-    return len(ports)
+    stat = mapping_index.get((client_ip, translation_ip, port_start, port_end))
+    return _popcount(stat["ports"]) if stat else 0
 
 
 def count_ports_by_protocol(client_ip, translation_ip, port_start, port_end, mapping_index):
     if mapping_index is None:
         return {}
-    proto_counts = defaultdict(int)
-    for m in mapping_index.get((client_ip, translation_ip), []):
-        if port_start <= m["translation_port"] <= port_end:
-            proto_counts[m.get("protocol", "?")] += 1
-    return dict(proto_counts)
+    stat = mapping_index.get((client_ip, translation_ip, port_start, port_end))
+    return dict(stat["protos"]) if stat else {}
 
 
 def determine_block_state(ports_used, ttl):
@@ -406,12 +444,13 @@ def print_enhanced_host_footer(host_ip, entries, mapping_index, pool_cfg):
         total_ports = 0
         proto_totals = defaultdict(int)
         for entry in entries:
-            ports_seen = set()
-            for m in mapping_index.get((host_ip, entry["external_ip"]), []):
-                if entry["port_start"] <= m["translation_port"] <= entry["port_end"]:
-                    ports_seen.add(m["translation_port"])
-                    proto_totals[m.get("protocol", "?")] += 1
-            total_ports += len(ports_seen)
+            stat = mapping_index.get(
+                (host_ip, entry["external_ip"], entry["port_start"], entry["port_end"])
+            )
+            if stat:
+                total_ports += _popcount(stat["ports"])
+                for protocol, count in stat["protos"].items():
+                    proto_totals[protocol] += count
         util_pct = (total_ports / total_capacity * 100) if total_capacity > 0 else 0
         print("  Total ports in use:    %6d  /  %d capacity" % (total_ports, total_capacity))
         print("  Overall utilization:   %5.1f%%" % util_pct)
@@ -494,7 +533,7 @@ def print_enhanced_pool_footer(entries, mapping_index, pool_cfg, pool_name, tota
         print("    %-20s %8d %7.1f%%" % (eip, cnt, alloc_pct))
 
 
-def show_host(host_ip, pba_entries, mapping_index, client_mapping_index, pools, enhanced=False):
+def show_host(host_ip, pba_entries, mapping_index, pools, enhanced=False):
     host_entries = [e for e in pba_entries if e["client_ip"] == host_ip]
     if not host_entries:
         print("No port block allocations found for %s" % host_ip)
@@ -511,7 +550,7 @@ def show_host(host_ip, pba_entries, mapping_index, client_mapping_index, pools, 
         print_enhanced_host_footer(host_ip, host_entries, mapping_index, pool_cfg)
 
 
-def show_pool(pool_name, pba_entries, mapping_index, client_mapping_index, pools, enhanced=False):
+def show_pool(pool_name, pba_entries, mapping_index, pools, enhanced=False):
     pool_cfg = pools.get(pool_name)
     if not pool_cfg:
         print("Pool '%s' not found. Available pools:" % pool_name)
@@ -533,7 +572,7 @@ def show_pool(pool_name, pba_entries, mapping_index, client_mapping_index, pools
         print_enhanced_pool_footer(pool_entries, mapping_index, pool_cfg, pool_name, total_blocks)
 
 
-def show_all(pba_entries, mapping_index, client_mapping_index, pools, enhanced=False):
+def show_all(pba_entries, mapping_index, pools, enhanced=False):
     pool_groups = defaultdict(list)
     for entry in pba_entries:
         found_pool, _ = find_pool_for_ip(entry["external_ip"], pools)
@@ -970,20 +1009,15 @@ def main():
     # All other modes: run tmsh + lsndb pba + (optionally) lsndb inbound concurrently
     want_inbound = not fast_mode
     with Timer("Fetching pool configs, PBA entries%s" % (" and inbound mappings" if want_inbound else "")):
-        pools, pba_entries, mappings = _collect_parallel(want_inbound=want_inbound)
+        pools, pba_entries, mapping_index = _collect_parallel(want_inbound=want_inbound)
 
     if not pba_entries:
         print("No PBA entries found.")
         sys.exit(0)
 
-    if fast_mode:
-        mapping_index = None
-        client_mapping_index = None
-        if not use_json:
-            print("[--no-inbound: port-in-use data omitted. Run without --no-inbound for full stats.]")
-            print()
-    else:
-        mapping_index, client_mapping_index = build_mapping_indexes(mappings)
+    if fast_mode and not use_json:
+        print("[--no-inbound: port-in-use data omitted. Run without --no-inbound for full stats.]")
+        print()
 
     if use_json:
         if args.pool:
@@ -998,7 +1032,7 @@ def main():
             result["fast_mode"] = True
         print(json.dumps(result, separators=(",", ":")))
     elif args.pool:
-        show_pool(args.pool, pba_entries, mapping_index, client_mapping_index, pools, enhanced=enhanced)
+        show_pool(args.pool, pba_entries, mapping_index, pools, enhanced=enhanced)
     elif args.xlated_ip:
         filtered = [e for e in pba_entries if e["external_ip"] == args.xlated_ip]
         if not filtered:
@@ -1016,9 +1050,9 @@ def main():
                 print_enhanced_pool_footer(filtered, mapping_index, pool_cfg, pool_name,
                                            total_blocks)
     elif args.all:
-        show_all(pba_entries, mapping_index, client_mapping_index, pools, enhanced=enhanced)
+        show_all(pba_entries, mapping_index, pools, enhanced=enhanced)
     else:
-        show_host(args.host_ip, pba_entries, mapping_index, client_mapping_index, pools, enhanced=enhanced)
+        show_host(args.host_ip, pba_entries, mapping_index, pools, enhanced=enhanced)
 
     if _timing:
         print("\n[%s] Script completed in %.3fs" % (datetime.now().strftime("%H:%M:%S.%f")[:-3], time.time() - script_start), file=sys.stderr)

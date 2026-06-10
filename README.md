@@ -41,6 +41,8 @@ F5 BIG-IP CGNAT uses PBA to allocate port blocks to subscribers. BIG-IP does not
 
 `lsndb list inbound` enumerates every active NAT flow and can take 20–30 minutes on deployments with 10,000+ subscribers. Use `--no-inbound` to skip it. Add `--timing` to print per-phase timestamps and elapsed times to stderr. See [python/README.md](python/README.md) for details on both flags.
 
+All lsndb output is streamed and aggregated on the fly, so memory stays bounded by allocated port blocks (~100 MB on large deployments) rather than active flows — safe to run on the BIG-IP control plane, which reserves most host RAM for TMM hugepages.
+
 ## Security
 
 For how to report a vulnerability and the project's supply-chain hygiene

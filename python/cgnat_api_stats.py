@@ -10,16 +10,15 @@ Usage:
     python cgnat_api_stats.py --bigip bigip.example.com --summary
 """
 
+from __future__ import annotations
+
 import argparse
 import getpass
-import json
 import os
-import re
 import sys
 import time
-from collections import defaultdict
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Tuple, Any
 
 import paramiko
 
@@ -76,8 +75,8 @@ def api_get(endpoint: str) -> Dict[str, Any]:
         raise Exception("SSH connection not established")
 
     # Use tmsh to get REST API data (more reliable than curl)
-    cmd = f'tmsh -c "cd /; show running-config security nat source-translation recursive"'
-    stdin, stdout, stderr = SSH_CLIENT.exec_command(cmd)
+    cmd = 'tmsh -c "cd /; show running-config security nat source-translation recursive"'
+    _, stdout, stderr = SSH_CLIENT.exec_command(cmd)
 
     output = stdout.read().decode('utf-8')
     error = stderr.read().decode('utf-8')
@@ -133,8 +132,9 @@ def get_pool_stats_api(pool_name: str) -> Dict[str, Any]:
     """Get detailed statistics for a specific pool via tmsh."""
     try:
         # Use tmsh to get pool statistics
+        assert SSH_CLIENT is not None, "SSH connection not established"
         cmd = f'tmsh show security nat source-translation {pool_name}'
-        stdin, stdout, stderr = SSH_CLIENT.exec_command(cmd)
+        _, stdout, stderr = SSH_CLIENT.exec_command(cmd)
 
         output = stdout.read().decode('utf-8')
         error = stderr.read().decode('utf-8')
@@ -160,8 +160,9 @@ def get_all_pool_stats_api() -> Dict[str, Dict]:
     """Get statistics for all pools via tmsh."""
     try:
         # Use tmsh to get all pool statistics
+        assert SSH_CLIENT is not None, "SSH connection not established"
         cmd = 'tmsh show security nat source-translation'
-        stdin, stdout, stderr = SSH_CLIENT.exec_command(cmd)
+        _, stdout, stderr = SSH_CLIENT.exec_command(cmd)
 
         output = stdout.read().decode('utf-8')
         error = stderr.read().decode('utf-8')

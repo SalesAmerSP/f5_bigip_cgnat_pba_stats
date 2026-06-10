@@ -14,6 +14,8 @@ Usage:
     python cgnat_pba_collect.py --output mysql --db-host localhost --db-name cgnat --db-user root --db-pass changeme
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import getpass
@@ -21,7 +23,6 @@ import ipaddress
 import os
 import re
 import sys
-from collections import defaultdict
 from datetime import datetime
 
 import paramiko
@@ -93,33 +94,7 @@ def ssh_command(cmd: str, timeout: int = 30) -> str:
     after the first requires a fresh connection. A brief delay avoids
     connection rate-limiting on the BIG-IP side.
     """
-    import time
-    global SSH_CLIENT
-    assert SSH_CLIENT is not None, "SSH connection not established"
-    client = SSH_CLIENT
-    stdout = stderr = None
-    try:
-        _, stdout, stderr = client.exec_command(cmd, timeout=timeout)
-    except paramiko.SSHException:
-        try:
-            client.close()
-        except Exception:
-            pass
-        last_err = None
-        for attempt in range(3):
-            try:
-                time.sleep(1 + attempt)
-                _do_ssh_connect()
-                assert SSH_CLIENT is not None
-                client = SSH_CLIENT
-                _, stdout, stderr = client.exec_command(cmd, timeout=timeout)
-                last_err = None
-                break
-            except Exception as e:
-                last_err = e
-        if last_err is not None:
-            raise last_err
-    assert stdout is not None and stderr is not None
+    _, stdout, stderr = _exec_with_retry(cmd, timeout)
     output = stdout.read().decode() or stderr.read().decode() or ""
     lines = output.strip().split("\n")
     if len(lines) > 2:
@@ -127,6 +102,43 @@ def ssh_command(cmd: str, timeout: int = 30) -> str:
         if lines[:mid] == lines[mid:]:
             lines = lines[:mid]
     return "\n".join(lines)
+
+
+def _exec_with_retry(cmd: str, timeout: int):
+    """Run exec_command, reconnecting up to 3 times on SSHException."""
+    import time
+    global SSH_CLIENT
+    assert SSH_CLIENT is not None, "SSH connection not established"
+    try:
+        return SSH_CLIENT.exec_command(cmd, timeout=timeout)
+    except paramiko.SSHException:
+        try:
+            SSH_CLIENT.close()
+        except Exception:
+            pass
+        last_err: Exception = paramiko.SSHException("unreachable")
+        for attempt in range(3):
+            try:
+                time.sleep(1 + attempt)
+                _do_ssh_connect()
+                assert SSH_CLIENT is not None
+                return SSH_CLIENT.exec_command(cmd, timeout=timeout)
+            except Exception as e:
+                last_err = e
+        raise last_err
+
+
+def ssh_stream_command(cmd: str, timeout: int = 3600):
+    """Execute a command via SSH and yield stdout lines one at a time.
+
+    lsndb dumps grow to several GB on busy CGNAT deployments; reading the
+    whole channel into one string (ssh_command) plus per-flow parsing is
+    what ran collection hosts out of memory, so large dumps must be consumed
+    line-by-line and never buffered whole.
+    """
+    _, stdout, _ = _exec_with_retry(cmd, timeout)
+    for line in stdout:
+        yield line
 
 # ---------------------------------------------------------------------------
 # Data collection from BIG-IP
@@ -167,51 +179,75 @@ def get_pool_configs() -> dict:
 
 
 def get_pba_entries() -> list[dict]:
-    """Get PBA entries from lsndb."""
-    raw = ssh_command("bash -c 'lsndb list pba'")
+    """Get PBA entries from lsndb (streamed; deduplicates repeated block lines)."""
+    pattern = re.compile(
+        r"(\d+\.\d+\.\d+\.\d+)\s+"
+        r"(\d+\.\d+\.\d+\.\d+):(\d+)\s+-\s+(\d+)\s+"
+        r"(?:\(\S+\)\s+)?"
+        r"(\S+)\s+"
+        r"(\d+)"
+    )
     entries = []
-    for line in raw.strip().split("\n"):
-        m = re.match(
-            r"(\d+\.\d+\.\d+\.\d+)\s+"
-            r"(\d+\.\d+\.\d+\.\d+):(\d+)\s+-\s+(\d+)\s+"
-            r"(?:\(\S+\)\s+)?"
-            r"(\S+)\s+"
-            r"(\d+)",
-            line,
-        )
-        if m:
-            entries.append({
-                "client_ip": m.group(1),
-                "external_ip": m.group(2),
-                "port_start": int(m.group(3)),
-                "port_end": int(m.group(4)),
-                "subscriber_id": m.group(5),
-                "ttl": int(m.group(6)),
-            })
+    seen = set()
+    for line in ssh_stream_command("bash -c 'lsndb list pba'"):
+        m = pattern.match(line)
+        if not m:
+            continue
+        # Block ranges are unique per external IP; a repeat means the BIG-IP
+        # echoed the output twice (the quirk ssh_command's halves-dedup handles).
+        key = (m.group(1), m.group(2), m.group(3))
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append({
+            "client_ip": m.group(1),
+            "external_ip": m.group(2),
+            "port_start": int(m.group(3)),
+            "port_end": int(m.group(4)),
+            "subscriber_id": m.group(5),
+            "ttl": int(m.group(6)),
+        })
     return entries
 
 
-def get_inbound_mappings() -> list[dict]:
-    """Get inbound mapping entries to count ports used per block."""
-    raw = ssh_command("bash -c 'lsndb list inbound'", timeout=60)
-    mappings = []
-    for line in raw.strip().split("\n"):
-        m = re.match(
-            r"(\d+\.\d+\.\d+\.\d+):(\d+)\s+"
-            r"(\d+\.\d+\.\d+\.\d+):(\d+)\s+"
-            r"\S+\s+"
-            r"(?:\s+)?"
-            r"(\S+)\s+"
-            r"(\d+)",
-            line,
+def get_inbound_index(pba_entries: list[dict]) -> dict:
+    """
+    Stream 'lsndb list inbound' and aggregate flows per allocated block:
+        (client_ip, external_ip, port_start, port_end) -> <bitmap of used ports>
+
+    The inbound dump has one line per active flow (millions on a busy box).
+    Folding flows into per-block bitmaps as they stream by keeps memory
+    bounded by allocated blocks instead of active flows.
+    """
+    blocks_by_key: dict[tuple[str, str], list] = {}
+    index: dict = {}
+    for e in pba_entries:
+        key = (e["client_ip"], e["external_ip"], e["port_start"], e["port_end"])
+        index[key] = 0
+        blocks_by_key.setdefault((e["client_ip"], e["external_ip"]), []).append(
+            (e["port_start"], e["port_end"], key)
         )
-        if m:
-            mappings.append({
-                "translation_ip": m.group(1),
-                "translation_port": int(m.group(2)),
-                "client_ip": m.group(3),
-            })
-    return mappings
+    pattern = re.compile(
+        r"(\d+\.\d+\.\d+\.\d+):(\d+)\s+"
+        r"(\d+\.\d+\.\d+\.\d+):(\d+)\s+"
+        r"\S+\s+"
+        r"(?:\s+)?"
+        r"(\S+)\s+"
+        r"(\d+)"
+    )
+    for line in ssh_stream_command("bash -c 'lsndb list inbound'"):
+        m = pattern.match(line)
+        if not m:
+            continue
+        blocks = blocks_by_key.get((m.group(3), m.group(1)))
+        if not blocks:
+            continue
+        port = int(m.group(2))
+        for start, end, key in blocks:
+            if start <= port <= end:
+                index[key] |= 1 << (port - start)
+                break
+    return index
 
 
 def find_pool_for_ip(external_ip: str, pools: dict) -> str | None:
@@ -242,7 +278,7 @@ def find_pool_for_ip(external_ip: str, pools: dict) -> str | None:
 # Aggregation (mirrors Perl logic)
 # ---------------------------------------------------------------------------
 
-def aggregate_per_subscriber(pba_entries: list[dict], mappings: list[dict],
+def aggregate_per_subscriber(pba_entries: list[dict], mapping_index: dict,
                              pools: dict) -> list[dict]:
     """Aggregate PBA data per subscriber IP per pool.
 
@@ -252,11 +288,6 @@ def aggregate_per_subscriber(pba_entries: list[dict], mappings: list[dict],
       - external IPs used (comma-separated)
       - block_size and client_block_limit from pool config
     """
-    # Build a fast lookup: (client_ip, translation_ip) -> set of translation ports
-    mapping_index: dict[tuple[str, str], set[int]] = defaultdict(set)
-    for m in mappings:
-        mapping_index[(m["client_ip"], m["translation_ip"])].add(m["translation_port"])
-
     # Group PBA entries by (client_ip, pool_name)
     client_pool_data: dict[tuple[str, str], dict] = {}
 
@@ -283,9 +314,10 @@ def aggregate_per_subscriber(pba_entries: list[dict], mappings: list[dict],
         data["external_ips"].add(entry["external_ip"])
 
         # Count ports used within this block
-        port_set = mapping_index.get((entry["client_ip"], entry["external_ip"]), set())
-        ports_used = sum(1 for p in port_set if entry["port_start"] <= p <= entry["port_end"])
-        data["ports"] += ports_used
+        bitmap = mapping_index.get(
+            (entry["client_ip"], entry["external_ip"], entry["port_start"], entry["port_end"]), 0
+        )
+        data["ports"] += bin(bitmap).count("1")
 
     # Convert sets to strings for output
     results = []
@@ -470,10 +502,10 @@ def main():
         sys.exit(0)
 
     print("Fetching inbound mappings...", file=sys.stderr)
-    mappings = get_inbound_mappings()
+    mapping_index = get_inbound_index(pba_entries)
 
     print("Aggregating per-subscriber data...", file=sys.stderr)
-    rows = aggregate_per_subscriber(pba_entries, mappings, pools)
+    rows = aggregate_per_subscriber(pba_entries, mapping_index, pools)
     print(f"Collected {len(rows)} subscriber/pool records.", file=sys.stderr)
 
     if args.output == "csv":

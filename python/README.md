@@ -91,6 +91,10 @@ Lab test with a pool containing 11 active subscribers (times scale with subscrib
 - **API approach**: 3x faster but lacks per-subscriber detail required for troubleshooting.
 - **Recommendation**: Use the API script for high-level monitoring/alerting; use lsndb for detailed subscriber analysis.
 
+### Memory footprint
+
+All scripts stream lsndb output and fold each flow into per-block counters as it arrives, so peak memory is bounded by allocated port blocks, not active flows (~100 MB at 20k subscribers / 3M flows). Earlier versions buffered the entire `lsndb list inbound` dump and built a record per flow, which grew past 4 GB on busy deployments — on the BIG-IP itself that exceeds the control plane's available host RAM (most is hugepage-reserved for TMM) and got the on-device script killed by the kernel OOM killer.
+
 **Missing from the API script:**
 
 - Individual client IP mappings
