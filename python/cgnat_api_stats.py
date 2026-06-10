@@ -66,7 +66,12 @@ def _do_ssh_connect():
     SSH_CLIENT = paramiko.SSHClient()
     if params["no_host_key_check"]:
         SSH_CLIENT.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    SSH_CLIENT.connect(**{k: v for k, v in params.items() if k != "no_host_key_check"})
+    # Refuse SHA-1 RSA signatures (CVE-2026-44405); rsa-sha2-256/512 and
+    # non-RSA keys still negotiate. TMOS 17.x sshd supports rsa-sha2.
+    SSH_CLIENT.connect(
+        disabled_algorithms={"pubkeys": ["ssh-rsa"], "keys": ["ssh-rsa"]},
+        **{k: v for k, v in params.items() if k != "no_host_key_check"},
+    )
 
 
 def api_get(endpoint: str) -> Dict[str, Any]:
