@@ -83,6 +83,9 @@ def _do_ssh_connect():
         key_filename=params["key_filename"], timeout=params["timeout"],
         allow_agent=params["allow_agent"],
         look_for_keys=params["look_for_keys"],
+        # Refuse SHA-1 RSA signatures (CVE-2026-44405); rsa-sha2-256/512 and
+        # non-RSA keys still negotiate. TMOS 17.x sshd supports rsa-sha2.
+        disabled_algorithms={"pubkeys": ["ssh-rsa"], "keys": ["ssh-rsa"]},
     )
 
 
